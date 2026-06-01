@@ -1,0 +1,250 @@
+diff --git a/src/Makefile b/src/Makefile
+index 6cceff5..ece1032 100644
+--- a/src/Makefile
++++ b/src/Makefile
+@@ -209,6 +209,18 @@ RT_LIBS := $(call whole_archive,$(LIBUV)) $(call whole_archive,$(LIBUTF8PROC)) $
+ # NB: CG needs uv_mutex_* symbols, but we expect to export them from libjulia-internal
+ CG_LIBS := $(LIBUNWIND) $(CG_LLVMLINK) $(OSLIBS) $(LIBTRACYCLIENT) $(LIBITTAPI)
+ 
++# Opt-in framehop-backed unwinder (test integration): build with
++#   make JULIA_FRAMEHOP=/abs/path/to/framehopunwind
++# which enables JL_USE_FRAMEHOP for the backtrace path and links libframehopunwind.
++ifdef JULIA_FRAMEHOP
++JCPPFLAGS += -DJL_ENABLE_FRAMEHOP -I$(JULIA_FRAMEHOP)/include
++# debuginfo.cpp (register_eh_frames) is in libjulia-codegen (CG_LIBS); the unwind cursor
++# code (stackwalk.c etc.) is in libjulia-internal (RT_LIBS). Both call into framehop.
++FRAMEHOP_LDLIBS := -L$(JULIA_FRAMEHOP)/target/release -lframehopunwind -Wl,-rpath,$(JULIA_FRAMEHOP)/target/release
++RT_LIBS += $(FRAMEHOP_LDLIBS)
++CG_LIBS += $(FRAMEHOP_LDLIBS)
++endif
++
+ ifeq ($(USEGCC),1)
+ ifeq ($(USE_RT_STATIC_LIBGCC),1)
+ RT_LIBS += -static-libgcc
+diff --git a/src/debuginfo.cpp b/src/debuginfo.cpp
+index bf497ae..e502dae 100644
+--- a/src/debuginfo.cpp
++++ b/src/debuginfo.cpp
+@@ -1512,7 +1512,8 @@ static DW_EH_PE parseCIE(const uint8_t *Addr, const uint8_t *End) JL_NOTSAFEPOIN
+ 
+ void register_eh_frames(uint8_t *Addr, size_t Size)
+ {
+-    // System unwinder
++    // System unwinder (used by C++ exception handling) — register regardless of which
++    // backtrace unwinder we use.
+     jl_profile_atomic([&]() JL_NOTSAFEPOINT {
+         __register_frame(Addr);
+     });
+@@ -1644,6 +1645,15 @@ void register_eh_frames(uint8_t *Addr, size_t Size)
+     jl_profile_atomic([&]() JL_NOTSAFEPOINT {
+         _U_dyn_register(di);
+     });
++
++#ifdef JL_USE_FRAMEHOP
++    // Also register with framehop (the backtrace unwinder). [start_ip, end_ip) is the code
++    // range already computed above; the .eh_frame bytes are copied internally, so Julia may
++    // free its buffer after deregistration.
++    jl_profile_atomic([&]() JL_NOTSAFEPOINT {
++        fh_register_jit(Addr, Size, (uint64_t)start_ip, (uint64_t)end_ip);
++    });
++#endif
+ }
+ 
+ void deregister_eh_frames(uint8_t *Addr, size_t Size)
+@@ -1654,6 +1664,12 @@ void deregister_eh_frames(uint8_t *Addr, size_t Size)
+     // Deregistering with our unwinder (_U_dyn_cancel) requires a lookup table
+     // to find the allocated entry above (or looking into libunwind's internal
+     // data structures).
++#ifdef JL_USE_FRAMEHOP
++    // framehop keys JIT modules by .eh_frame address, so Addr is enough to deregister.
++    jl_profile_atomic([&]() JL_NOTSAFEPOINT {
++        fh_deregister_jit_eh_frame(Addr);
++    });
++#endif
+ }
+ 
+ #else
+diff --git a/src/dlload.c b/src/dlload.c
+index 1a1e228..a1361f8 100644
+--- a/src/dlload.c
++++ b/src/dlload.c
+@@ -215,6 +215,11 @@ JL_DLLEXPORT JL_NO_SANITIZE void *jl_dlopen(const char *filename, unsigned flags
+     struct link_map *map = (struct link_map*)hnd;
+     if (filename && map)
+       ForEachMappedRegion(map, __msan_unpoison);
++#endif
++#ifdef JL_USE_FRAMEHOP
++    // A newly-loaded object means new modules to unwind through; re-scan (off-signal).
++    if (hnd && !(flags & JL_RTLD_NOLOAD))
++        fh_modules_refresh();
+ #endif
+     return hnd;
+ }
+diff --git a/src/init.c b/src/init.c
+index e4efe16..87289d6 100644
+--- a/src/init.c
++++ b/src/init.c
+@@ -592,6 +592,13 @@ static NOINLINE void _finish_jl_init_(jl_image_buf_t sysimage, jl_ptls_t ptls, j
+ 
+     jl_init_codegen();
+ 
++#ifdef JL_USE_FRAMEHOP
++    // Bring up the framehop unwinder and enumerate already-loaded modules. Must run off
++    // any signal path (it allocates the slot pool and copies unwind sections).
++    fh_init(0);
++    fh_thread_register();
++#endif
++
+     if (sysimage.kind != JL_IMAGE_KIND_NONE) {
+         // Load the .ji or .so sysimage
+         jl_restore_system_image(&parsed_image, sysimage);
+diff --git a/src/julia_internal.h b/src/julia_internal.h
+index f220459..0e6fec6 100644
+--- a/src/julia_internal.h
++++ b/src/julia_internal.h
+@@ -1583,6 +1583,15 @@ typedef struct {
+     int inlined;
+ } jl_frame_t;
+ 
++// framehop-backed unwinding (opt-in). The build defines JL_ENABLE_FRAMEHOP to turn this
++// on; JL_USE_FRAMEHOP is then derived for the (os, arch) combinations framehop supports.
++// When off, everything below is byte-for-byte the existing libunwind/dbghelp path.
++#if !defined(JL_USE_FRAMEHOP) && defined(JL_ENABLE_FRAMEHOP)
++#  if (defined(_OS_LINUX_) || defined(_OS_FREEBSD_)) && (defined(_CPU_X86_64_) || defined(_CPU_AARCH64_))
++#    define JL_USE_FRAMEHOP 1
++#  endif
++#endif
++
+ #ifdef _OS_WINDOWS_
+ #include <dbghelp.h>
+ JL_DLLEXPORT EXCEPTION_DISPOSITION NTAPI __julia_personality(
+@@ -1607,7 +1616,20 @@ void jl_profile_process_dll_events(void) JL_NOTSAFEPOINT;
+ #  include <libunwind.h>
+ #pragma GCC visibility pop
+ typedef unw_context_t bt_context_t;
++// framehop integration is additive: libunwind stays linked (task.c context switching and
++// proc-info lookup still use it), but the *backtrace* cursor is framehop's. On
++// Linux/FreeBSD unw_context_t == ucontext_t, so jl_unw_init can extract framehop's
++// registers straight from a bt_context_t.
++#  ifdef JL_USE_FRAMEHOP
++// Default visibility so the fh_* references bind to the shared libframehopunwind
++// (Julia builds with -fvisibility=hidden; same treatment as libunwind.h above).
++#    pragma GCC visibility push(default)
++#    include "framehopunwind.h"
++#    pragma GCC visibility pop
++typedef fh_cursor bt_cursor_t;
++#  else
+ typedef unw_cursor_t bt_cursor_t;
++#  endif
+ #  if (!defined(SYSTEM_LIBUNWIND) || UNW_VERSION_MAJOR > 1 ||   \
+        (UNW_VERSION_MAJOR == 1 && UNW_VERSION_MINOR != 0 && UNW_VERSION_MINOR != 1))
+ // Enable our memory manager only for libunwind with our patch or
+diff --git a/src/stackwalk.c b/src/stackwalk.c
+index 3b3c21d..fa45efd 100644
+--- a/src/stackwalk.c
++++ b/src/stackwalk.c
+@@ -19,11 +19,21 @@ uv_mutex_t jl_in_stackwalk;
+ uv_mutex_t jl_dll_notify_lock;
+ #define jl_unw_get(context) (RtlCaptureContext(context), 0)
+ #elif !defined(JL_DISABLE_LIBUNWIND)
++// Also used under JL_USE_FRAMEHOP: libunwind stays linked and unw_getcontext fills a
++// bt_context_t (== ucontext_t) that jl_unw_init converts to framehop registers.
+ #define jl_unw_get(context) unw_getcontext(context)
+ #else
+ int jl_unw_get(void *context) { return -1; }
+ #endif
+ 
++// Release the cursor's resources when stepping is finished. framehop cursors own a pooled
++// cache/slot that must be returned; other unwinders need nothing here.
++#if defined(JL_USE_FRAMEHOP)
++#define jl_unw_fini(cursor) fh_cursor_fini(cursor)
++#else
++#define jl_unw_fini(cursor) ((void)0)
++#endif
++
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+@@ -207,6 +217,7 @@ NOINLINE size_t rec_backtrace_ctx(jl_bt_element_t *bt_data, size_t maxsize,
+         return 0;
+     size_t bt_size = 0;
+     jl_unw_stepn(&cursor, bt_data, &bt_size, NULL, maxsize, 0, &pgcstack, 1);
++    jl_unw_fini(&cursor);
+     return bt_size;
+ }
+ 
+@@ -228,6 +239,7 @@ NOINLINE size_t rec_backtrace(jl_bt_element_t *bt_data, size_t maxsize, int skip
+     jl_gcframe_t *pgcstack = jl_pgcstack;
+     size_t bt_size = 0;
+     jl_unw_stepn(&cursor, bt_data, &bt_size, NULL, maxsize, skip + 1, &pgcstack, 0);
++    jl_unw_fini(&cursor);
+     return bt_size;
+ }
+ 
+@@ -294,6 +306,10 @@ JL_DLLEXPORT jl_value_t *jl_backtrace_from_here(int returnsp, int skip)
+             skip = 0;
+             offset += size_incr;
+         }
++        // Release the cursor's pooled slot as soon as stepping is done, before the
++        // (allocating, hence possibly-throwing) GC-value harvest below — otherwise an
++        // OutOfMemoryError there would longjmp past the fini and permanently leak the slot.
++        jl_unw_fini(&cursor);
+         jl_array_del_end(ip, jl_array_nrows(ip) - offset);
+         if (returnsp)
+             jl_array_del_end(sp, jl_array_nrows(sp) - offset);
+@@ -736,6 +752,27 @@ static int jl_unw_step(bt_cursor_t *cursor, int from_signal_handler, uintptr_t *
+ #endif
+ }
+ 
++#elif defined(JL_USE_FRAMEHOP)
++// stacktrace using framehop (async-signal-safe; no dl_iterate_phdr / malloc / locks)
++
++static int jl_unw_init(bt_cursor_t *cursor, bt_context_t *context)
++{
++    fh_context c;
++    // bt_context_t is a ucontext_t here; pull out the registers framehop needs.
++    fh_context_from_ucontext(&c, (const void*)context);
++    return fh_cursor_init(cursor, &c) == 0;
++}
++
++static int jl_unw_step(bt_cursor_t *cursor, int from_signal_handler, uintptr_t *ip, uintptr_t *sp)
++{
++    (void)from_signal_handler; // framehop reports the current frame, then advances
++    uint64_t i = 0, s = 0;
++    int r = fh_step(cursor, &i, &s);
++    *ip = (uintptr_t)i;
++    *sp = (uintptr_t)s;
++    return r > 0;
++}
++
+ #elif !defined(JL_DISABLE_LIBUNWIND)
+ // stacktrace using libunwind
+ 
+diff --git a/src/threading.c b/src/threading.c
+index 0b5c718..769c7c5 100644
+--- a/src/threading.c
++++ b/src/threading.c
+@@ -391,7 +391,7 @@ jl_ptls_t jl_init_threadtls(int16_t tid)
+     jl_fence();
+     uv_mutex_unlock(&tls_lock);
+ 
+-#if !defined(_OS_WINDOWS_) && !defined(JL_DISABLE_LIBUNWIND) && !defined(LLVMLIBUNWIND)
++#if !defined(_OS_WINDOWS_) && !defined(JL_DISABLE_LIBUNWIND) && !defined(LLVMLIBUNWIND) && !defined(JL_USE_FRAMEHOP)
+     // ensures libunwind TLS space for this thread is allocated eagerly
+     // to make unwinding async-signal-safe even when using thread local caches.
+     unw_tls_ensure_func jl_unw_ensure_tls = NULL;
+@@ -400,6 +400,14 @@ jl_ptls_t jl_init_threadtls(int16_t tid)
+         jl_unw_ensure_tls();
+ #endif
+ 
++#ifdef JL_USE_FRAMEHOP
++    // Eagerly preallocate framehop's per-thread cache and capture this thread's stack
++    // bounds off the signal path. NB: this tightens reads only for *same-thread* unwinding
++    // (rec_backtrace); the suspend-based profiler runs the cursor on the sampler thread, so
++    // it falls back to the sp-derived window plus jl_set_safe_restore for the target.
++    fh_thread_register();
++#endif
++
+     return ptls;
+ }
+ 

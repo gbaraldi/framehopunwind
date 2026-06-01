@@ -1,0 +1,49 @@
+[package]
+name = "framehopunwind"
+version = "0.1.0"
+edition = "2021"
+description = "A clean C unwinding API backed by framehop, with JIT registration, intended to replace libunwind/dbghelp in Julia."
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Produce both a C-callable shared library and a static library so Julia can
+# link whichever it prefers, plus an rlib for in-crate tests.
+[lib]
+name = "framehopunwind"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+# framehop is the actual unwinding engine. We carry both arch backends (only the
+# native one is used at runtime) and all unwind-info formats so a single build
+# can serve ELF/Mach-O/PE depending on the host OS. Pinned via Cargo.lock for
+# reproducible builds (the JIT pcrel resolution is verified against gimli 0.33).
+framehop = { version = "0.16", default-features = false, features = ["std", "macho", "pe"] }
+# Same gimli version framehop pins; used to derive a JIT module's code range from its
+# .eh_frame when the caller doesn't supply one (fh_register_jit_auto).
+gimli = { version = "0.33", default-features = false, features = ["read", "std"] }
+cfg-if = "1"
+
+# Unix: dl_iterate_phdr / dyld, ucontext_t / mcontext_t register access, pthread stack bounds.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Windows: module enumeration, PE parsing, RtlCaptureContext / thread context.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+] }
+
+[profile.release]
+# Keep frame pointers and debug info: this library is itself part of the unwinder
+# and is frequently on the stack during sampling.
+debug = true
+# A Rust panic must never unwind across the C FFI boundary into Julia's signal frame.
+# Release (the shipped artifact) aborts instead of unwinding. We additionally avoid
+# panicking on the hot path. Dev/test keep the default unwind strategy so `cargo test`
+# works on stable.
+panic = "abort"

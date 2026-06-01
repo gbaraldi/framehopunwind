@@ -1,0 +1,4 @@
+# This library is itself part of the unwinder and benefits from frame pointers; the
+# tests also use a manual frame-pointer walk as an independent oracle for DWARF unwinding.
+[build]
+rustflags = ["-C", "force-frame-pointers=yes"]
