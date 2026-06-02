@@ -77,6 +77,10 @@ void fh_capture_context(fh_context *ctx);
  * platform context type; any other non-NULL value is undefined behavior. */
 void fh_context_from_ucontext(fh_context *ctx, const void *os_ctx);
 
+/* Fill *ctx from a Darwin mach thread state (__darwin_x86_thread_state64 /
+ * __darwin_arm_thread_state64) — what Julia's bt_context_t holds on macOS. */
+void fh_context_from_thread_state(fh_context *ctx, const void *thread_state);
+
 /* ---- cursor (async-signal-safe read path) ---- */
 
 /* Initialize *cur to unwind from *ctx. Returns 0 on success, <0 on failure

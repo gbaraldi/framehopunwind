@@ -121,6 +121,18 @@ mod api {
         crate::capture::context_from_os(ctx, os_ctx);
     }
 
+    /// Fill `*ctx` from a Darwin mach thread state (`__darwin_{x86,arm}_thread_state64`),
+    /// which is what Julia's `bt_context_t` holds on macOS. Async-signal-safe.
+    #[no_mangle]
+    pub extern "C" fn fh_context_from_thread_state(ctx: *mut FhContext, ts: *const c_void) {
+        if ctx.is_null() {
+            return;
+        }
+        // SAFETY: ctx is a valid, caller-allocated FhContext.
+        let ctx = unsafe { &mut *ctx };
+        crate::capture::context_from_thread_state(ctx, ts);
+    }
+
     /// Initialize `cur` to unwind from `ctx`. Returns 0 on success, `<0` on failure (no
     /// modules published, or the slot pool is exhausted). Async-signal-safe.
     #[no_mangle]
@@ -225,6 +237,8 @@ mod api_stub {
     pub extern "C" fn fh_modules_refresh() {}
     #[no_mangle]
     pub extern "C" fn fh_context_from_ucontext(_ctx: *mut c_void, _os_ctx: *const c_void) {}
+    #[no_mangle]
+    pub extern "C" fn fh_context_from_thread_state(_ctx: *mut c_void, _ts: *const c_void) {}
     #[no_mangle]
     pub extern "C" fn fh_cursor_init(_cur: *mut c_void, _ctx: *const c_void) -> c_int {
         -1

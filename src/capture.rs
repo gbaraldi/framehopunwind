@@ -149,6 +149,42 @@ unsafe fn fill_from_os(ctx: &mut FhContext, os_ctx: *const core::ffi::c_void) {
     ctx.r[2] = c.Rbp;
 }
 
+/// Fill `*ctx` from a Darwin **mach thread state** — `__darwin_x86_thread_state64` or
+/// `__darwin_arm_thread_state64`. This is what Julia's `bt_context_t` actually holds on
+/// macOS (it casts the mach thread state to `unw_context_t`; both the profiler's
+/// `thread_get_state` and `unw_getcontext` land in this layout). Reading a `ucontext_t`
+/// there would be wrong, hence this separate entry point. Async-signal-safe.
+pub fn context_from_thread_state(ctx: &mut FhContext, ts: *const core::ffi::c_void) {
+    *ctx = FhContext::zeroed();
+    if ts.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees `ts` points at the platform thread-state struct.
+    unsafe { fill_from_thread_state(ctx, ts) }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn fill_from_thread_state(ctx: &mut FhContext, ts: *const core::ffi::c_void) {
+    // __darwin_x86_thread_state64: rax,rbx,rcx,rdx,rdi,rsi,rbp,rsp,r8..r15,rip,... (u64 each)
+    let p = ts as *const u64;
+    ctx.r[0] = core::ptr::read_unaligned(p.add(16)); // rip
+    ctx.r[1] = core::ptr::read_unaligned(p.add(7)); // rsp
+    ctx.r[2] = core::ptr::read_unaligned(p.add(6)); // rbp
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn fill_from_thread_state(ctx: &mut FhContext, ts: *const core::ffi::c_void) {
+    // __darwin_arm_thread_state64: x[0..28] (29), fp(x29), lr(x30), sp, pc, cpsr (u64 each)
+    let p = ts as *const u64;
+    ctx.r[0] = core::ptr::read_unaligned(p.add(32)); // pc
+    ctx.r[1] = core::ptr::read_unaligned(p.add(31)); // sp
+    ctx.r[2] = core::ptr::read_unaligned(p.add(29)); // fp (x29)
+    ctx.r[3] = core::ptr::read_unaligned(p.add(30)); // lr (x30)
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+unsafe fn fill_from_thread_state(_ctx: &mut FhContext, _ts: *const core::ffi::c_void) {}
+
 // Any (os, arch) we don't special-case: leave the context zeroed.
 #[cfg(not(any(
     all(target_os = "linux", target_arch = "x86_64"),
