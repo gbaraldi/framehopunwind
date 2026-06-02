@@ -2,16 +2,3 @@
 # tests also use a manual frame-pointer walk as an independent oracle for DWARF unwinding.
 [build]
 rustflags = ["-C", "force-frame-pointers=yes"]
-
-# On macOS, set the dylib's install name to @rpath/libframehopunwind.dylib at link time, so
-# a consumer that links it (Julia's libjulia-internal / libjulia-codegen) records an
-# @rpath dependency and resolves it from its own dir (usr/lib) via @loader_path. Doing this
-# at link time — rather than post-build install_name_tool — keeps ld's ad-hoc code
-# signature valid (post-build edits would invalidate it on Apple Silicon -> "killed: 9").
-# NB: a cfg-target rustflags table REPLACES [build].rustflags, so the frame-pointer flag is
-# repeated here. The -install_name linker arg is macOS-only and never reaches a Linux build.
-[target.'cfg(target_os = "macos")']
-rustflags = [
-    "-C", "force-frame-pointers=yes",
-    "-C", "link-arg=-Wl,-install_name,@rpath/libframehopunwind.dylib",
-]
