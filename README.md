@@ -28,6 +28,8 @@ The split is deliberate:
 
 The one bounded resource is the cursor **slot pool** (`fh_init(num_slots)`, default 256). If every slot is busy, `fh_cursor_init` returns an error and that sample is skipped — it never blocks or allocates.
 
+**Fault / slot-lifetime contract.** `fh_step`'s stack reads are bounds-checked but only *fault-bounded*: with the sp-derived fallback window (a thread that didn't call `fh_thread_register`) a bad address can still `SIGSEGV`. The crate intentionally installs **no** `SIGSEGV` handler (it would clash with the embedder's). So: (1) call `fh_thread_register` on every unwound thread to get exact, fault-free bounds; and (2) always run `fh_cursor_fini` for each successful `fh_cursor_init`, **including on fault recovery** — if a SIGSEGV-recovery `longjmp` skips `fh_cursor_fini`, that slot leaks and the pool eventually drains. Julia is safe here because `jl_set_safe_restore`'s `setjmp` is local to `jl_unw_stepn`, so a caught fault still returns to the caller that runs `fh_cursor_fini`. See the header for the full contract.
+
 ## Platform / architecture support
 
 framehop is x86_64 + aarch64 only, and its PE backend is x86_64-only.

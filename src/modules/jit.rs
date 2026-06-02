@@ -21,10 +21,23 @@
 //! buffer immediately after deregistration.
 
 use core::ops::Range;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use framehop::{ExplicitModuleSectionInfo, Module};
 
 use crate::state::Bytes;
+
+/// Cumulative count of JIT registrations that failed (bad args or no usable FDEs).
+/// Diagnostic only.
+pub(crate) static JIT_REGISTER_FAILURES: AtomicUsize = AtomicUsize::new(0);
+
+#[inline]
+fn note_fail(rc: i32) -> i32 {
+    if rc < 0 {
+        JIT_REGISTER_FAILURES.fetch_add(1, Ordering::Relaxed);
+    }
+    rc
+}
 
 /// Build and register a JIT module from a live `.eh_frame` buffer.
 ///
@@ -36,12 +49,12 @@ pub fn register_jit_eh_frame(
     text_hi: u64,
 ) -> i32 {
     if eh_frame_ptr.is_null() || eh_frame_len == 0 || text_hi <= text_lo {
-        return -1;
+        return note_fail(-1);
     }
     // framehop addresses a module relative to base_avma as a u32, so a single region
     // must be < 4 GiB. (Julia JIT regions are tiny; split if this ever trips.)
     if text_hi - text_lo > u32::MAX as u64 {
-        return -2;
+        return note_fail(-2);
     }
 
     let eh_frame_runtime = eh_frame_ptr as u64;
@@ -83,14 +96,14 @@ pub fn register_jit_eh_frame(
 /// Returns 0 on success, `<0` on bad arguments or if no FDEs were found.
 pub fn register_jit_eh_frame_auto(eh_frame_ptr: *const u8, eh_frame_len: usize) -> i32 {
     if eh_frame_ptr.is_null() || eh_frame_len == 0 {
-        return -1;
+        return note_fail(-1);
     }
     let eh_frame_runtime = eh_frame_ptr as u64;
     // SAFETY: caller guarantees [eh_frame_ptr, +len) is readable at call time.
     let bytes = unsafe { core::slice::from_raw_parts(eh_frame_ptr, eh_frame_len) };
     let (text_lo, text_hi) = match fde_pc_range(bytes, eh_frame_runtime) {
         Some(r) => r,
-        None => return -3, // no usable FDEs
+        None => return note_fail(-3), // no usable FDEs
     };
     register_jit_eh_frame(eh_frame_ptr, eh_frame_len, text_lo, text_hi)
 }

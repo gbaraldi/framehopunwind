@@ -17,6 +17,31 @@
  *     (startup, dlopen, JIT compile), where Julia already serializes with
  *     jl_profile_atomic.
  *
+ * ---------------------------------------------------------------------------
+ * Fault & cursor-slot lifetime contract (IMPORTANT — read before consuming)
+ * ---------------------------------------------------------------------------
+ * fh_step reads the target's live stack. The read is bounds-checked, but it is
+ * fault-*bounded*, not fault-free: with only the sp-derived fallback window (a thread
+ * that did NOT call fh_thread_register) the window can include unmapped pages, so a
+ * corrupt stack / bad unwind info can still make the read hit a SIGSEGV. To make reads
+ * fault-free, call fh_thread_register on every thread that will be unwound — that records
+ * the exact (mapped) stack bounds, so out-of-stack addresses become a clean end-of-stack
+ * instead of a fault. This crate does NOT install its own SIGSEGV handler (it would
+ * conflict with the embedder's, e.g. Julia's).
+ *
+ * A cursor owns a pooled slot (a preallocated unwind cache) from fh_cursor_init until
+ * fh_cursor_fini. The pool is finite (fh_init's num_slots); if it is exhausted
+ * fh_cursor_init returns <0 (skip that sample) — it never blocks or allocates.
+ *
+ * Therefore the caller MUST guarantee fh_cursor_fini runs for every successful
+ * fh_cursor_init, INCLUDING on any fault-recovery path. If you rely on a SIGSEGV handler
+ * that longjmp/siglongjmps out of fh_step to survive a bad read, the recovery target must
+ * be at or below the stepping scope so that fh_cursor_fini still runs afterwards;
+ * otherwise the slot is never released and, over repeated faults, the pool drains and all
+ * later fh_cursor_init calls fail (backtraces silently stop). Julia satisfies this: its
+ * jl_set_safe_restore setjmp is local to jl_unw_stepn, so a caught fault returns from
+ * jl_unw_stepn and the caller still runs fh_cursor_fini (jl_unw_fini).
+ *
  * Mapping to libunwind:
  *   unw_getcontext / RtlCaptureContext      -> fh_capture_context
  *   (signal ucontext_t / CONTEXT)           -> fh_context_from_ucontext

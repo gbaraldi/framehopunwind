@@ -109,6 +109,19 @@ mod api {
         crate::modules::refresh();
     }
 
+    /// Diagnostic: number of JIT modules currently registered with framehop.
+    #[no_mangle]
+    pub extern "C" fn fh_jit_module_count() -> usize {
+        crate::modules::jit_module_count()
+    }
+
+    /// Diagnostic: cumulative number of JIT registrations that failed (e.g. unparsable
+    /// `.eh_frame`). A nonzero value means some JIT code fell back to frame pointers.
+    #[no_mangle]
+    pub extern "C" fn fh_jit_register_failures() -> usize {
+        crate::modules::jit_register_failures()
+    }
+
     /// Fill `*ctx` from an OS context: a `ucontext_t*` (Unix signal handler 3rd arg) or a
     /// `CONTEXT*` (Windows). Async-signal-safe.
     #[no_mangle]

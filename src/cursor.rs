@@ -5,6 +5,26 @@
 //! cache). `fh_step` mirrors Julia's `jl_unw_step` contract exactly: it **outputs the
 //! current frame's ip/sp, then advances** the cursor, returning `>0` if a further frame
 //! exists, `0` at a clean end, `<0` on error.
+//!
+//! # Fault & slot-lifetime contract
+//!
+//! `fh_step`'s stack reads are bounds-checked but only *fault-bounded*: with the
+//! sp-derived fallback window (a thread that did not call `fh_thread_register`) a bad
+//! address can still hit `SIGSEGV`. We deliberately do **not** install a `SIGSEGV` handler
+//! (it would conflict with the embedder's). Two consequences the caller must respect:
+//!
+//!  1. To make reads fault-free, register every unwound thread (`fh_thread_register`) so
+//!     `read_stack` has the exact mapped stack bounds; out-of-stack reads then become a
+//!     clean end-of-stack instead of a fault.
+//!  2. A cursor holds a pooled slot from [`cursor_init`] until [`cursor_fini`]. The caller
+//!     MUST run `cursor_fini` for every successful init, **including on a fault-recovery
+//!     path**. If a bad read faults and the embedder recovers via a `longjmp` out of
+//!     `fh_step`, that `longjmp`'s target must sit at or below the stepping scope so
+//!     `cursor_fini` still runs afterwards — otherwise the slot leaks and, over repeated
+//!     faults, the fixed pool drains and later `cursor_init`s fail (backtraces silently
+//!     stop). Julia satisfies this: `jl_set_safe_restore`'s `setjmp` is local to
+//!     `jl_unw_stepn`, so a caught fault returns from it and the caller still runs
+//!     `fh_cursor_fini`.
 
 use core::ffi::c_int;
 

@@ -140,6 +140,16 @@ pub(crate) fn remove_jit_module(key: u64) {
     reg.jit_by_eh_frame.retain(|_, v| *v != key);
 }
 
+/// Number of JIT modules currently registered (diagnostic).
+pub(crate) fn jit_module_count() -> usize {
+    registry().jit_keys.len()
+}
+
+/// Cumulative count of failed JIT registrations (diagnostic).
+pub(crate) fn jit_register_failures() -> usize {
+    jit::JIT_REGISTER_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Remove a JIT module by the `.eh_frame` runtime address used at registration.
 pub(crate) fn remove_jit_module_by_eh_frame(eh_frame_addr: u64) {
     let key = {
