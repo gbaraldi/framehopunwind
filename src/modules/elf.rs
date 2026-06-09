@@ -5,7 +5,7 @@
 //! memory, and build a framehop `EhFrameHdrAndEhFrame` module. ELF SVMA == AVMA - bias,
 //! so `base_svma = 0` and `base_avma = dlpi_addr`.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::ffi::CStr;
 use std::ops::Range;
 
@@ -32,20 +32,23 @@ struct RawSpec {
 }
 
 struct Collector<'a> {
-    known: &'a HashSet<u64>,
-    current_keys: HashSet<u64>,
+    known: &'a HashMap<u64, u64>,
+    current: HashMap<u64, u64>,
     specs: Vec<RawSpec>,
 }
 
-pub fn enumerate(known: &HashSet<u64>) -> EnumResult {
+pub fn enumerate(known: &HashMap<u64, u64>) -> EnumResult {
     let mut collector = Collector {
         known,
-        current_keys: HashSet::new(),
+        current: HashMap::new(),
         specs: Vec::new(),
     };
     // SAFETY: standard dl_iterate_phdr usage; callback does not unwind or call dlopen.
     unsafe {
-        libc::dl_iterate_phdr(Some(callback), &mut collector as *mut _ as *mut libc::c_void);
+        libc::dl_iterate_phdr(
+            Some(callback),
+            &mut collector as *mut _ as *mut libc::c_void,
+        );
     }
 
     let new_modules = collector
@@ -55,7 +58,7 @@ pub fn enumerate(known: &HashSet<u64>) -> EnumResult {
         .collect();
 
     EnumResult {
-        current_keys: collector.current_keys,
+        current: collector.current,
         new_modules,
     }
 }
@@ -86,9 +89,7 @@ extern "C" fn callback(
     if info.dlpi_phdr.is_null() || info.dlpi_phnum == 0 {
         return 0;
     }
-    let phdrs = unsafe {
-        core::slice::from_raw_parts(info.dlpi_phdr, info.dlpi_phnum as usize)
-    };
+    let phdrs = unsafe { core::slice::from_raw_parts(info.dlpi_phdr, info.dlpi_phnum as usize) };
 
     // Geometry: union of PT_LOAD; remember the executable segment and the eh_frame_hdr.
     let mut avma_lo = u64::MAX;
@@ -123,10 +124,26 @@ extern "C" fn callback(
         return 0; // no loadable segments
     }
     let key = avma_lo;
-    collector.current_keys.insert(key);
 
-    // Only build (and copy bytes for) modules we don't already know about.
-    if collector.known.contains(&key) {
+    // Fingerprint the image so a dlclose/dlopen pair that reuses the same base address is
+    // detected as a *different* module (and re-scanned) instead of silently keeping the
+    // old image's unwind data. Name + eh_frame_hdr geometry + load span is cheap and
+    // distinguishes any two real images.
+    let name_bytes: &[u8] = if info.dlpi_name.is_null() {
+        b""
+    } else {
+        unsafe { CStr::from_ptr(info.dlpi_name) }.to_bytes()
+    };
+    let (hdr_vaddr, hdr_memsz) = match hdr_phdr {
+        Some(p) => (p.p_vaddr as u64, p.p_memsz as u64),
+        None => (0, 0),
+    };
+    let fp = super::fingerprint_of(&[hdr_vaddr, hdr_memsz, avma_hi - avma_lo], name_bytes);
+    collector.current.insert(key, fp);
+
+    // Only build (and copy bytes for) modules we don't already know about (same key AND
+    // same fingerprint; a changed fingerprint means the base address was reused).
+    if collector.known.get(&key) == Some(&fp) {
         return 0;
     }
 
@@ -156,16 +173,14 @@ extern "C" fn callback(
     let eh_frame_len = (eh_frame_end - eh_frame_avma) as usize;
 
     // Copy both sections (under the dl lock, so no concurrent dlclose).
-    let eh_frame_hdr: Bytes = unsafe {
-        core::slice::from_raw_parts(hdr_avma as *const u8, hdr_len)
-    }
-    .to_vec()
-    .into_boxed_slice();
-    let eh_frame: Bytes = unsafe {
-        core::slice::from_raw_parts(eh_frame_avma as *const u8, eh_frame_len)
-    }
-    .to_vec()
-    .into_boxed_slice();
+    let eh_frame_hdr: Bytes =
+        unsafe { core::slice::from_raw_parts(hdr_avma as *const u8, hdr_len) }
+            .to_vec()
+            .into_boxed_slice();
+    let eh_frame: Bytes =
+        unsafe { core::slice::from_raw_parts(eh_frame_avma as *const u8, eh_frame_len) }
+            .to_vec()
+            .into_boxed_slice();
 
     let name = if info.dlpi_name.is_null() || unsafe { *info.dlpi_name } == 0 {
         String::from("<main>")
@@ -236,9 +251,9 @@ unsafe fn decode_eh_frame_start(hdr: *const u8, hdr_len: usize) -> Option<u64> {
     let (value, _sz) = decode_value(&b[field_off..], fmt)?;
 
     let base = match app {
-        0x00 => 0u64,         // DW_EH_PE_absptr
-        0x10 => field_avma,   // DW_EH_PE_pcrel
-        _ => return None,     // datarel/textrel/etc. not expected for eh_frame_ptr
+        0x00 => 0u64,       // DW_EH_PE_absptr
+        0x10 => field_avma, // DW_EH_PE_pcrel
+        _ => return None,   // datarel/textrel/etc. not expected for eh_frame_ptr
     };
     Some(base.wrapping_add(value))
 }

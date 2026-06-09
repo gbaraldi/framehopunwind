@@ -21,13 +21,23 @@
  * Fault & cursor-slot lifetime contract (IMPORTANT — read before consuming)
  * ---------------------------------------------------------------------------
  * fh_step reads the target's live stack. The read is bounds-checked, but it is
- * fault-*bounded*, not fault-free: with only the sp-derived fallback window (a thread
- * that did NOT call fh_thread_register) the window can include unmapped pages, so a
- * corrupt stack / bad unwind info can still make the read hit a SIGSEGV. To make reads
- * fault-free, call fh_thread_register on every thread that will be unwound — that records
- * the exact (mapped) stack bounds, so out-of-stack addresses become a clean end-of-stack
- * instead of a fault. This crate does NOT install its own SIGSEGV handler (it would
- * conflict with the embedder's, e.g. Julia's).
+ * fault-*bounded*, not fault-free: with only the sp-derived fallback window the window
+ * can include unmapped pages, so a corrupt stack / bad unwind info can still make the
+ * read hit a SIGSEGV. To make reads fault-free, give the walk exact mapped bounds:
+ *   - same-thread walks on the thread's own pthread stack: call fh_thread_register on
+ *     that thread beforehand (records its pthread stack bounds in TLS);
+ *   - cross-thread walks (a sampler unwinding a suspended target) or walks over an
+ *     embedder-managed stack (e.g. a Julia task stack): the registered bounds CANNOT
+ *     apply — pass the target's stack range to fh_cursor_init_bounds instead.
+ * With exact bounds, out-of-stack addresses become a clean end-of-stack instead of a
+ * fault. This crate does NOT install its own SIGSEGV handler (it would conflict with the
+ * embedder's, e.g. Julia's).
+ *
+ * fh_thread_register also pre-faults this library's thread-local storage. Any thread
+ * that will RUN the unwinder (including sampler/listener threads that only ever unwind
+ * *other* threads) must call it once off the signal/suspend path: the first TLS access
+ * from a thread can otherwise allocate (dyld lazy TLV on macOS, __tls_get_addr on ELF)
+ * at exactly the wrong moment.
  *
  * A cursor owns a pooled slot (a preallocated unwind cache) from fh_cursor_init until
  * fh_cursor_fini. The pool is finite (fh_init's num_slots); if it is exhausted
@@ -73,8 +83,23 @@ typedef struct fh_cursor {
     uint64_t _opaque[8];
 } fh_cursor;
 
+/* ABI lock: these sizes are hard-coded on both sides of the boundary (the Rust library
+ * carries matching const assertions), because callers stack-allocate both types. */
+#define FH_CONTEXT_SIZE 40
+#define FH_CURSOR_SIZE 64
+#if defined(__cplusplus) && __cplusplus >= 201103L
+static_assert(sizeof(fh_context) == FH_CONTEXT_SIZE, "fh_context ABI size drift");
+static_assert(sizeof(fh_cursor) == FH_CURSOR_SIZE, "fh_cursor ABI size drift");
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+_Static_assert(sizeof(fh_context) == FH_CONTEXT_SIZE, "fh_context ABI size drift");
+_Static_assert(sizeof(fh_cursor) == FH_CURSOR_SIZE, "fh_cursor ABI size drift");
+#endif
+
 /* 1 if this build can unwind natively on the current (os, arch); 0 otherwise.
- * When 0, all other functions are no-op stubs returning failure — the caller should
+ * When 0 on a non-x86_64/non-aarch64 build, all other functions are no-op stubs
+ * returning failure. When 0 on a supported arch but unhandled OS, the lifecycle calls
+ * (fh_init, fh_register_jit, ...) still succeed against an empty module set and only the
+ * cursor path fails (fh_cursor_init < 0). Either way the caller should gate here and
  * keep using the existing unwinder (libunwind / dbghelp). */
 int fh_supported(void);
 
@@ -88,8 +113,17 @@ int fh_init(size_t num_slots);
  * thread that will be unwound/profiled, before any sampling. */
 void fh_thread_register(void);
 
-/* Re-scan loaded modules (call after dlopen/dlclose; JIT modules are preserved). */
+/* Re-scan loaded modules (call after dlopen AND dlclose; JIT modules are preserved).
+ * On macOS this is a no-op once fh_init has run: dyld's add/remove-image callbacks keep
+ * the module set current automatically. */
 void fh_modules_refresh(void);
+
+/* Diagnostics: number of JIT modules currently registered, and the cumulative count of
+ * failed JIT registrations (bad arguments or unparsable .eh_frame — such code falls back
+ * to frame-pointer stepping). Useful for asserting in embedder tests that registration
+ * is actually happening. Not async-signal-safe (takes the registry lock). */
+size_t fh_jit_module_count(void);
+size_t fh_jit_register_failures(void);
 
 /* ---- context capture (async-signal-safe) ---- */
 
@@ -112,7 +146,16 @@ void fh_context_from_thread_state(fh_context *ctx, const void *thread_state);
  * (no modules published yet, or the slot pool is exhausted). */
 int fh_cursor_init(fh_cursor *cur, const fh_context *ctx);
 
-/* Output the CURRENT frame's ip/sp into *ip/*sp, then advance one frame.
+/* Like fh_cursor_init, with an explicit stack-read window [stack_lo, stack_hi) for the
+ * walk. Pass the *target* thread's (or task's) exact stack range when unwinding a context
+ * captured from another thread (suspended-target sampler) or running on an
+ * embedder-managed stack — the fh_thread_register bounds only ever cover the *current*
+ * thread's own pthread stack — which makes the stack reads fault-free. Passing 0, 0 (or
+ * an empty range) falls back to the registered-bounds / sp-window heuristic. */
+int fh_cursor_init_bounds(fh_cursor *cur, const fh_context *ctx,
+                          uint64_t stack_lo, uint64_t stack_hi);
+
+/* Output the CURRENT frame's ip/sp into *ip and *sp, then advance one frame.
  * Returns:  >0  a frame was produced and more may follow;
  *            0  reached the end of the stack (clean);
  *           <0  error. Mirrors Julia's jl_unw_step contract exactly. */

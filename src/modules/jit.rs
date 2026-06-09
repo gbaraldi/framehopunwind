@@ -41,7 +41,9 @@ fn note_fail(rc: i32) -> i32 {
 
 /// Build and register a JIT module from a live `.eh_frame` buffer.
 ///
-/// Returns 0 on success, `<0` on bad arguments.
+/// Returns 0 on success, `<0` on bad arguments or an unparsable `.eh_frame` (counted in
+/// [`JIT_REGISTER_FAILURES`]; the code then falls back to frame-pointer stepping rather
+/// than registering a module that claims a range it cannot unwind).
 pub fn register_jit_eh_frame(
     eh_frame_ptr: *const u8,
     eh_frame_len: usize,
@@ -60,10 +62,18 @@ pub fn register_jit_eh_frame(
     let eh_frame_runtime = eh_frame_ptr as u64;
     // Copy the bytes into owned memory (off the signal path).
     // SAFETY: the caller guarantees [eh_frame_ptr, +len) is readable at call time.
-    let eh_frame_copy: Bytes =
-        unsafe { core::slice::from_raw_parts(eh_frame_ptr, eh_frame_len) }
-            .to_vec()
-            .into_boxed_slice();
+    let eh_frame_copy: Bytes = unsafe { core::slice::from_raw_parts(eh_frame_ptr, eh_frame_len) }
+        .to_vec()
+        .into_boxed_slice();
+
+    // Validate that the section parses end-to-end before handing it to framehop:
+    // framehop's internal FDE-index build has no error channel back to us, and an
+    // unparsable .eh_frame would otherwise register a module that *claims*
+    // [text_lo, text_hi) while providing no unwind data — shadowing the frame-pointer
+    // fallback. Failing loudly (counted in fh_jit_register_failures) is strictly better.
+    if fde_pc_range(&eh_frame_copy, eh_frame_runtime).is_none() {
+        return note_fail(-3);
+    }
 
     let info: ExplicitModuleSectionInfo<Bytes> = ExplicitModuleSectionInfo {
         // base_svma == base_avma == text_lo (see module docs).
@@ -125,19 +135,32 @@ fn fde_pc_range(eh_frame_bytes: &[u8], eh_frame_runtime: u64) -> Option<(u64, u6
     let mut lo = u64::MAX;
     let mut hi = 0u64;
     let mut found = false;
-    while let Ok(Some(entry)) = entries.next() {
-        if let CieOrFde::Fde(partial) = entry {
-            if let Ok(fde) = partial.parse(|_, bases, o| eh_frame.cie_from_offset(bases, o)) {
-                let start = fde.initial_address();
-                let end = start.wrapping_add(fde.len());
-                if start < lo {
-                    lo = start;
+    loop {
+        match entries.next() {
+            Ok(Some(entry)) => {
+                if let CieOrFde::Fde(partial) = entry {
+                    // A failing FDE (or CIE resolution) means the section is malformed:
+                    // refuse to register a silently *partial* range, which would claim
+                    // code we cannot actually unwind.
+                    let fde = match partial.parse(|_, bases, o| eh_frame.cie_from_offset(bases, o))
+                    {
+                        Ok(f) => f,
+                        Err(_) => return None,
+                    };
+                    let start = fde.initial_address();
+                    let end = start.wrapping_add(fde.len());
+                    if start < lo {
+                        lo = start;
+                    }
+                    if end > hi {
+                        hi = end;
+                    }
+                    found = true;
                 }
-                if end > hi {
-                    hi = end;
-                }
-                found = true;
             }
+            Ok(None) => break,
+            // Malformed section header/terminator mid-scan: same reasoning as above.
+            Err(_) => return None,
         }
     }
     if found && hi > lo {

@@ -2,3 +2,13 @@
 # tests also use a manual frame-pointer walk as an independent oracle for DWARF unwinding.
 [build]
 rustflags = ["-C", "force-frame-pointers=yes"]
+
+# rustc emits no DT_SONAME for cdylibs; set it explicitly on ELF targets so consumers
+# don't depend on the linker's basename fallback for soname-less libraries. NB: a matching
+# [target.'cfg(...)'] rustflags entry REPLACES build.rustflags, so repeat the
+# frame-pointer flag here. (The -soname link-arg is inert for rlib/test artifacts.)
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))']
+rustflags = [
+    "-C", "force-frame-pointers=yes",
+    "-C", "link-arg=-Wl,-soname,libframehopunwind.so",
+]

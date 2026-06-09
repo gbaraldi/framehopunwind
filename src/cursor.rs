@@ -48,6 +48,17 @@ pub struct FhCursor {
     _reserved: [u64; 6],
 }
 
+// Compile-time ABI lock: the C header hard-codes these layouts (fh_cursor as
+// uint64_t[8], fh_context as uint64_t[5]) and Julia stack-allocates both, so silent
+// drift would corrupt the caller's stack frame. The header carries the matching
+// static_asserts via FH_CURSOR_SIZE / FH_CONTEXT_SIZE.
+const _: () = {
+    assert!(core::mem::size_of::<FhCursor>() == 64);
+    assert!(core::mem::align_of::<FhCursor>() == 8);
+    assert!(core::mem::size_of::<crate::arch::FhContext>() == 40);
+    assert!(core::mem::align_of::<crate::arch::FhContext>() == 8);
+};
+
 impl FhCursor {
     #[inline]
     fn invalidate(&mut self) {
@@ -60,15 +71,21 @@ impl FhCursor {
     }
 }
 
-/// Compute the effective stack-read window for a walk starting at `sp`.
+/// Compute the effective stack-read window for a walk starting at `sp`, when the caller
+/// did not pass explicit bounds.
 ///
-/// Prefer the thread's exact registered bounds (these are fault-safe — they cover only
-/// mapped stack). Otherwise fall back to a *bounded* window above the starting sp (the
-/// stack grows downward, so callers' frames are at higher addresses). The fallback only
-/// caps how far a stray pointer can stray; it does NOT guarantee fault-freedom (the window
-/// may include unmapped pages past the real stack top), so a faulting read is still
-/// possible and the embedder must catch SIGSEGV (Julia uses `jl_set_safe_restore`). The
-/// fallback span is kept near a typical `RLIMIT_STACK` rather than wide.
+/// Prefer the thread's registered bounds — but note these are the *current* (unwinding)
+/// thread's pthread-stack bounds, so they only apply to same-thread walks whose sp is on
+/// that stack; a cross-thread walk (sampler unwinding a suspended target) or a walk over
+/// an embedder-managed stack (e.g. a Julia task stack) never matches and takes the
+/// fallback. Callers that know the target's exact stack range should pass it to
+/// [`cursor_init_bounds`] instead, which both covers those cases and makes the reads
+/// fault-free. The fallback is a *bounded* window above the starting sp (the stack grows
+/// downward, so callers' frames are at higher addresses): it caps how far a stray pointer
+/// can stray but does NOT guarantee fault-freedom (the window may include unmapped pages
+/// past the real stack top), so a faulting read is still possible and the embedder must
+/// catch SIGSEGV (Julia uses `jl_set_safe_restore`). The fallback span is kept near a
+/// typical `RLIMIT_STACK` rather than wide.
 fn stack_window(sp: u64) -> (u64, u64) {
     const FALLBACK_SPAN: u64 = 16 * 1024 * 1024; // 16 MiB above sp (~typical RLIMIT_STACK)
     let (lo, hi) = crate::stackbounds::current();
@@ -84,6 +101,21 @@ fn stack_window(sp: u64) -> (u64, u64) {
 ///
 /// Returns 0 on success, `<0` on failure (no published modules, or no free slot).
 pub fn cursor_init(cur: &mut FhCursor, ctx: &FhContext) -> c_int {
+    cursor_init_bounds(cur, ctx, 0, 0)
+}
+
+/// Like [`cursor_init`], but with an explicit stack-read window `[stack_lo, stack_hi)`
+/// for the walk. Pass the *target* thread's (or task's) exact stack range when unwinding
+/// a context that is not the current thread's — the per-thread registered bounds cannot
+/// cover that case — which makes the stack reads fault-free. Passing `0, 0` (or an empty
+/// range) falls back to the registered-bounds / sp-window heuristic. Async-signal-safe
+/// (explicit bounds skip even the thread-local lookup).
+pub fn cursor_init_bounds(
+    cur: &mut FhCursor,
+    ctx: &FhContext,
+    stack_lo: u64,
+    stack_hi: u64,
+) -> c_int {
     cur.invalidate();
 
     let slot_idx = match state::claim_slot() {
@@ -102,7 +134,11 @@ pub fn cursor_init(cur: &mut FhCursor, ctx: &FhContext) -> c_int {
     let mask = ptr_auth_mask(max_code);
 
     let sp0 = arch::context_sp(ctx);
-    let (lo, hi) = stack_window(sp0);
+    let (lo, hi) = if stack_lo < stack_hi {
+        (stack_lo, stack_hi) // explicit, trusted verbatim; no TLS touched
+    } else {
+        stack_window(sp0)
+    };
 
     // Populate the slot's per-walk state.
     let slot = match state::slot(slot_idx) {

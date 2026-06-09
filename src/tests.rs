@@ -101,7 +101,37 @@ fn ensure_init() {
     state::init(0);
     #[cfg(unix)]
     crate::stackbounds::register_current_thread();
-    modules::refresh();
+    modules::init();
+}
+
+/// Build a minimal, *valid* `.eh_frame` (one CIE + one FDE covering
+/// `[text_lo, text_lo + text_len)`, absptr-encoded so it works at any buffer address,
+/// then the 4-byte terminator). Registration validates that sections parse end-to-end,
+/// so churn tests need a real section, not just a terminator.
+fn synthetic_eh_frame(text_lo: u64, text_len: u64) -> Vec<u8> {
+    #[cfg(target_arch = "x86_64")]
+    const RA_REG: u8 = 16;
+    #[cfg(target_arch = "aarch64")]
+    const RA_REG: u8 = 30;
+
+    let mut v = Vec::with_capacity(52);
+    // CIE: length 16, id 0, version 1, aug "zR\0", code_align 1, data_align -8 (sleb),
+    // ra reg, aug len 1, R = DW_EH_PE_absptr, 3 nops of padding.
+    v.extend_from_slice(&16u32.to_le_bytes());
+    v.extend_from_slice(&0u32.to_le_bytes());
+    v.extend_from_slice(&[1, b'z', b'R', 0, 0x01, 0x78, RA_REG, 0x01, 0x00, 0, 0, 0]);
+    debug_assert_eq!(v.len(), 20);
+    // FDE: length 24, cie_pointer 24 (distance from this field back to the CIE),
+    // pc_begin/pc_range as absptr u64, aug len 0, 3 nops of padding.
+    v.extend_from_slice(&24u32.to_le_bytes());
+    v.extend_from_slice(&24u32.to_le_bytes());
+    v.extend_from_slice(&text_lo.to_le_bytes());
+    v.extend_from_slice(&text_len.to_le_bytes());
+    v.extend_from_slice(&[0x00, 0, 0, 0]);
+    debug_assert_eq!(v.len(), 48);
+    // Terminator.
+    v.extend_from_slice(&0u32.to_le_bytes());
+    v
 }
 
 /// Compare framehop ips (offset by one for the capture-site leaf frame) against the fp
@@ -118,9 +148,11 @@ fn assert_frames_match(label: &str, fh: &[u64], fp: &[u64], min_frames: usize) {
     assert!(n >= min_frames, "{label}: only {n} comparable frames");
     for i in 0..n {
         assert_eq!(
-            fh[i + 1], fp[i],
+            fh[i + 1],
+            fp[i],
             "{label}: frame {i} mismatch: framehop={:#x} fp={:#x}\n fh={fh:#x?}\n fp={fp:#x?}",
-            fh[i + 1], fp[i]
+            fh[i + 1],
+            fp[i]
         );
     }
 }
@@ -143,18 +175,19 @@ fn concurrent_register_and_unwind_is_stable() {
         .map(|w| {
             let stop = stop.clone();
             std::thread::spawn(move || {
-                // A minimal, well-formed empty eh_frame (single terminator) so registration
-                // builds a (possibly empty) index without touching real memory unsafely.
-                let eh: Vec<u8> = vec![0, 0, 0, 0];
                 let mut i = 0u64;
                 while !stop.load(Ordering::Relaxed) {
                     let text_lo = 0x10_0000_0000u64 + (w as u64) * 0x100_0000 + (i % 64) * 0x1000;
-                    crate::modules::register_jit_eh_frame(
+                    // A minimal valid one-FDE eh_frame so registration passes validation
+                    // and actually churns the snapshot.
+                    let eh = synthetic_eh_frame(text_lo, 0x800);
+                    let rc = crate::modules::register_jit_eh_frame(
                         eh.as_ptr(),
                         eh.len(),
                         text_lo,
                         text_lo + 0x800,
                     );
+                    assert_eq!(rc, 0, "synthetic eh_frame must register");
                     crate::modules::deregister_jit(text_lo);
                     i += 1;
                 }
@@ -203,6 +236,162 @@ fn eager_self_backtrace_matches_frame_pointers() {
     );
     #[cfg(target_arch = "x86_64")]
     assert_frames_match("eager", &fh_ips, &fp_rets, 3);
+}
+
+/// Explicit bounds are honored verbatim: a tiny window truncates the walk cleanly, and
+/// the thread's real stack range walks as far as the default heuristic.
+#[test]
+fn cursor_init_bounds_clamps_reads() {
+    ensure_init();
+
+    let mut ctx = FhContext::zeroed();
+    capture::fh_capture_context(&mut ctx);
+    let sp = crate::arch::context_sp(&ctx);
+
+    // Window covering almost nothing above sp: the walk must stop quickly and cleanly.
+    let mut cur: FhCursor = unsafe { core::mem::zeroed() };
+    let rc = cursor::cursor_init_bounds(&mut cur, &ctx, sp & !0x7, (sp & !0x7) + 16);
+    assert_eq!(rc, 0, "cursor_init_bounds failed: {rc}");
+    let (mut ip, mut spo) = (0u64, 0u64);
+    let mut frames = 0;
+    for _ in 0..64 {
+        let more = cursor::step(&mut cur, &mut ip, &mut spo);
+        if ip != 0 {
+            frames += 1;
+        }
+        if more <= 0 {
+            break;
+        }
+    }
+    cursor::cursor_fini(&mut cur);
+    assert!(
+        frames <= 3,
+        "tiny window should truncate the walk, got {frames} frames"
+    );
+
+    // The thread's real (registered) stack range, passed explicitly, unwinds normally.
+    let (lo, hi) = crate::stackbounds::current();
+    if lo != 0 && hi != 0 {
+        let mut cur: FhCursor = unsafe { core::mem::zeroed() };
+        let rc = cursor::cursor_init_bounds(&mut cur, &ctx, lo, hi);
+        assert_eq!(rc, 0);
+        let mut frames = 0;
+        for _ in 0..64 {
+            let more = cursor::step(&mut cur, &mut ip, &mut spo);
+            if ip != 0 {
+                frames += 1;
+            }
+            if more <= 0 {
+                break;
+            }
+        }
+        cursor::cursor_fini(&mut cur);
+        assert!(
+            frames >= 3,
+            "explicit real bounds should unwind, got {frames} frames"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Context-extraction layout tests: the embedder-facing entry points
+// (fh_context_from_ucontext / fh_context_from_thread_state) are raw-offset reads of OS
+// structs. Validate them against libc's struct definitions (the ground truth the kernel
+// and libunwind share) with sentinel values, so silent layout drift fails the tests.
+// ---------------------------------------------------------------------------
+
+const SENT_IP: u64 = 0x1111_2222_3333_4444;
+const SENT_SP: u64 = 0x5555_6666_7777_8888;
+const SENT_FP: u64 = 0x9999_aaaa_bbbb_cccc;
+#[cfg(any(target_os = "macos", all(target_os = "linux", target_arch = "aarch64")))]
+const SENT_LR: u64 = 0xdddd_eeee_ffff_0123;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn darwin_thread_state_layout_matches_libc() {
+    let mut ss: libc::__darwin_arm_thread_state64 = unsafe { core::mem::zeroed() };
+    ss.__pc = SENT_IP;
+    ss.__sp = SENT_SP;
+    ss.__fp = SENT_FP;
+    ss.__lr = SENT_LR;
+    let mut ctx = FhContext::zeroed();
+    capture::context_from_thread_state(&mut ctx, &ss as *const _ as *const core::ffi::c_void);
+    assert_eq!(ctx.r[0], SENT_IP);
+    assert_eq!(ctx.r[1], SENT_SP);
+    assert_eq!(ctx.r[2], SENT_FP);
+    assert_eq!(ctx.r[3], SENT_LR);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+#[test]
+fn darwin_thread_state_layout_matches_libc() {
+    let mut ss: libc::__darwin_x86_thread_state64 = unsafe { core::mem::zeroed() };
+    ss.__rip = SENT_IP;
+    ss.__rsp = SENT_SP;
+    ss.__rbp = SENT_FP;
+    let mut ctx = FhContext::zeroed();
+    capture::context_from_thread_state(&mut ctx, &ss as *const _ as *const core::ffi::c_void);
+    assert_eq!(ctx.r[0], SENT_IP);
+    assert_eq!(ctx.r[1], SENT_SP);
+    assert_eq!(ctx.r[2], SENT_FP);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn darwin_ucontext_layout_matches_libc() {
+    let mut mc: libc::__darwin_mcontext64 = unsafe { core::mem::zeroed() };
+    #[cfg(target_arch = "aarch64")]
+    {
+        mc.__ss.__pc = SENT_IP;
+        mc.__ss.__sp = SENT_SP;
+        mc.__ss.__fp = SENT_FP;
+        mc.__ss.__lr = SENT_LR;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        mc.__ss.__rip = SENT_IP;
+        mc.__ss.__rsp = SENT_SP;
+        mc.__ss.__rbp = SENT_FP;
+    }
+    let mut uc: libc::ucontext_t = unsafe { core::mem::zeroed() };
+    uc.uc_mcontext = &mut mc;
+    let mut ctx = FhContext::zeroed();
+    capture::context_from_os(&mut ctx, &uc as *const _ as *const core::ffi::c_void);
+    assert_eq!(ctx.r[0], SENT_IP);
+    assert_eq!(ctx.r[1], SENT_SP);
+    assert_eq!(ctx.r[2], SENT_FP);
+    #[cfg(target_arch = "aarch64")]
+    assert_eq!(ctx.r[3], SENT_LR);
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn linux_ucontext_layout_matches_libc() {
+    let mut uc: libc::ucontext_t = unsafe { core::mem::zeroed() };
+    uc.uc_mcontext.gregs[libc::REG_RIP as usize] = SENT_IP as i64;
+    uc.uc_mcontext.gregs[libc::REG_RSP as usize] = SENT_SP as i64;
+    uc.uc_mcontext.gregs[libc::REG_RBP as usize] = SENT_FP as i64;
+    let mut ctx = FhContext::zeroed();
+    capture::context_from_os(&mut ctx, &uc as *const _ as *const core::ffi::c_void);
+    assert_eq!(ctx.r[0], SENT_IP);
+    assert_eq!(ctx.r[1], SENT_SP);
+    assert_eq!(ctx.r[2], SENT_FP);
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[test]
+fn linux_ucontext_layout_matches_libc() {
+    let mut uc: libc::ucontext_t = unsafe { core::mem::zeroed() };
+    uc.uc_mcontext.pc = SENT_IP;
+    uc.uc_mcontext.sp = SENT_SP;
+    uc.uc_mcontext.regs[29] = SENT_FP;
+    uc.uc_mcontext.regs[30] = SENT_LR;
+    let mut ctx = FhContext::zeroed();
+    capture::context_from_os(&mut ctx, &uc as *const _ as *const core::ffi::c_void);
+    assert_eq!(ctx.r[0], SENT_IP);
+    assert_eq!(ctx.r[1], SENT_SP);
+    assert_eq!(ctx.r[2], SENT_FP);
+    assert_eq!(ctx.r[3], SENT_LR);
 }
 
 // ---------------------------------------------------------------------------
@@ -280,7 +469,11 @@ mod jit_path {
         std::str::from_utf8(&data[off..end]).unwrap_or("")
     }
 
-    fn build_jit_module(bias: u64, eh_frame_addr: u64, eh_frame_len: usize) -> Module<state::Bytes> {
+    fn build_jit_module(
+        bias: u64,
+        eh_frame_addr: u64,
+        eh_frame_len: usize,
+    ) -> Module<state::Bytes> {
         let eh_frame_copy: state::Bytes =
             unsafe { core::slice::from_raw_parts(eh_frame_addr as *const u8, eh_frame_len) }
                 .to_vec()

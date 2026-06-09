@@ -28,7 +28,15 @@ The split is deliberate:
 
 The one bounded resource is the cursor **slot pool** (`fh_init(num_slots)`, default 256). If every slot is busy, `fh_cursor_init` returns an error and that sample is skipped — it never blocks or allocates.
 
-**Fault / slot-lifetime contract.** `fh_step`'s stack reads are bounds-checked but only *fault-bounded*: with the sp-derived fallback window (a thread that didn't call `fh_thread_register`) a bad address can still `SIGSEGV`. The crate intentionally installs **no** `SIGSEGV` handler (it would clash with the embedder's). So: (1) call `fh_thread_register` on every unwound thread to get exact, fault-free bounds; and (2) always run `fh_cursor_fini` for each successful `fh_cursor_init`, **including on fault recovery** — if a SIGSEGV-recovery `longjmp` skips `fh_cursor_fini`, that slot leaks and the pool eventually drains. Julia is safe here because `jl_set_safe_restore`'s `setjmp` is local to `jl_unw_stepn`, so a caught fault still returns to the caller that runs `fh_cursor_fini`. See the header for the full contract.
+**Fault / slot-lifetime contract.** `fh_step`'s stack reads are bounds-checked but only *fault-bounded*: with the sp-derived fallback window a bad address can still `SIGSEGV`. The crate intentionally installs **no** `SIGSEGV` handler (it would clash with the embedder's). So:
+
+1. give walks exact bounds — `fh_thread_register` covers same-thread walks on that thread's own pthread stack; for **cross-thread** walks (a sampler unwinding a suspended target) or walks over embedder-managed stacks (e.g. Julia task stacks) the registered bounds *cannot* apply, so pass the target's stack range to `fh_cursor_init_bounds`. With exact bounds, out-of-stack reads become a clean end-of-stack instead of a fault;
+2. call `fh_thread_register` once on every thread that will **run** the unwinder (including sampler/listener threads), off the signal/suspend path — it also pre-faults this library's thread-local storage, whose first access can otherwise allocate (dyld lazy TLV on macOS, `__tls_get_addr` on ELF) at exactly the wrong moment;
+3. always run `fh_cursor_fini` for each successful `fh_cursor_init`, **including on fault recovery** — if a SIGSEGV-recovery `longjmp` skips `fh_cursor_fini`, that slot leaks and the pool eventually drains. Julia is safe here because `jl_set_safe_restore`'s `setjmp` is local to `jl_unw_stepn`, so a caught fault still returns to the caller that runs `fh_cursor_fini`.
+
+See the header for the full contract.
+
+**`fork()`.** The read path is fork-safe (atomics over an immutable snapshot). The mutating path is not: the child inherits the registry/writer mutexes in whatever state they were in, so if another thread held one at `fork` time, the child's next registration/refresh deadlocks; slots claimed by other threads at fork stay `in_use` in the child. This matches the embedder posture (Julia does not support forking a threaded process); a `pthread_atfork` reset could be added if an embedder needs it.
 
 ## Platform / architecture support
 

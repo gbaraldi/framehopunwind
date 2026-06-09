@@ -42,9 +42,9 @@ mod cursor;
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 mod modules;
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-mod state;
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 mod stackbounds;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+mod state;
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub use cursor::FhCursor;
@@ -66,7 +66,11 @@ pub const FRAMEHOP_SUPPORTED: bool = cfg!(any(
     ),
     all(
         target_arch = "aarch64",
-        any(target_os = "linux", target_os = "freebsd", target_os = "macos")
+        any(
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "macos"
+        )
     )
 ));
 
@@ -87,14 +91,33 @@ mod api {
     use crate::cursor::FhCursor;
 
     /// Initialize the library: allocate the unwinding slot pool and enumerate the
-    /// currently-loaded modules. Idempotent. `num_slots == 0` selects a default (256).
-    /// Returns 0 on success. **Not** async-signal-safe; call once at startup.
+    /// currently-loaded modules (on macOS, by installing dyld's add/remove-image
+    /// callbacks, which keep the set current from then on). Idempotent. `num_slots == 0`
+    /// selects a default (256). Returns 0 on success. **Not** async-signal-safe; call
+    /// once at startup.
     #[no_mangle]
     pub extern "C" fn fh_init(num_slots: usize) -> c_int {
+        install_panic_hook();
         crate::state::init(num_slots);
-        crate::modules::refresh();
+        crate::modules::init();
         0
     }
+
+    /// In the shipped artifact (`panic = "abort"`) std would still run the default panic
+    /// hook — which formats, locks stderr, and may allocate — before aborting. A panic
+    /// reachable from the read path would therefore hang in malloc inside a signal
+    /// handler instead of dying. The read path is written to be panic-free, but if a bug
+    /// ever introduces one, degrade to a raw `write(2)` + abort instead.
+    #[cfg(all(panic = "abort", unix))]
+    fn install_panic_hook() {
+        std::panic::set_hook(Box::new(|_| {
+            let msg = b"framehopunwind: internal panic; aborting\n";
+            // SAFETY: plain write(2) to stderr; async-signal-safe.
+            unsafe { libc::write(2, msg.as_ptr().cast(), msg.len()) };
+        }));
+    }
+    #[cfg(not(all(panic = "abort", unix)))]
+    fn install_panic_hook() {}
 
     /// Capture per-thread state needed off the signal path: preallocated stack bounds.
     /// Call once per thread that will be unwound (profiled), before any sampling.
@@ -157,6 +180,28 @@ mod api {
         let cur = unsafe { &mut *cur };
         let ctx = unsafe { &*ctx };
         crate::cursor::cursor_init(cur, ctx)
+    }
+
+    /// Like `fh_cursor_init`, with an explicit stack-read window `[stack_lo, stack_hi)`.
+    /// Pass the *target* thread's (or task's) exact stack range when unwinding a context
+    /// captured from another thread (a suspended-target sampler) or from an
+    /// embedder-managed stack — the per-thread registered bounds cannot cover those — to
+    /// make the stack reads fault-free. `0, 0` falls back to the registered-bounds /
+    /// sp-window heuristic. Async-signal-safe.
+    #[no_mangle]
+    pub extern "C" fn fh_cursor_init_bounds(
+        cur: *mut FhCursor,
+        ctx: *const FhContext,
+        stack_lo: u64,
+        stack_hi: u64,
+    ) -> c_int {
+        if cur.is_null() || ctx.is_null() {
+            return -100;
+        }
+        // SAFETY: caller-allocated, correctly sized (see FH_CURSOR_SIZE in the header).
+        let cur = unsafe { &mut *cur };
+        let ctx = unsafe { &*ctx };
+        crate::cursor::cursor_init_bounds(cur, ctx, stack_lo, stack_hi)
     }
 
     /// Output the current frame's ip/sp into `*ip`/`*sp`, then advance one frame.
@@ -254,6 +299,15 @@ mod api_stub {
     pub extern "C" fn fh_context_from_thread_state(_ctx: *mut c_void, _ts: *const c_void) {}
     #[no_mangle]
     pub extern "C" fn fh_cursor_init(_cur: *mut c_void, _ctx: *const c_void) -> c_int {
+        -1
+    }
+    #[no_mangle]
+    pub extern "C" fn fh_cursor_init_bounds(
+        _cur: *mut c_void,
+        _ctx: *const c_void,
+        _stack_lo: u64,
+        _stack_hi: u64,
+    ) -> c_int {
         -1
     }
     #[no_mangle]

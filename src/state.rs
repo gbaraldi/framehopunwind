@@ -22,7 +22,7 @@
 
 use core::cell::UnsafeCell;
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use framehop::{
@@ -139,6 +139,37 @@ static WRITER: Mutex<WriterState> = Mutex::new(WriterState {
 
 const DEFAULT_SLOTS: usize = 256;
 
+/// Count of `with_writer` publishes, driving the periodic rule-cache sweep below.
+static PUBLISHES: AtomicU64 = AtomicU64::new(0);
+
+/// framehop keys its per-cache unwind-rule entries by `(address, modules_generation)`
+/// where the generation is a global **u16** bumped on every module add/remove — after
+/// 65535 mutations it wraps, and a never-cleared entry in a rarely-claimed slot could
+/// then resurrect a stale rule for recycled code. Sweeping all claimable slot caches
+/// every `CACHE_SWEEP_PERIOD` publishes (each publish is >= 1 mutation) keeps every
+/// cache's contents well inside one generation cycle. Writer-thread only; allocation is
+/// fine here.
+const CACHE_SWEEP_PERIOD: u64 = 4096;
+
+fn sweep_slot_caches() {
+    if let Some(slots) = slots() {
+        for s in slots {
+            if s.in_use
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                // SAFETY: we own the slot via the CAS; replacing the cache cannot race a
+                // reader. A slot held by an in-flight walk is skipped — its cache entries
+                // are at most one walk old and the next sweep will catch it.
+                unsafe {
+                    s.inner_mut().cache = CacheNative::new_in();
+                }
+                s.in_use.store(false, Ordering::Release);
+            }
+        }
+    }
+}
+
 /// Initialize the slot pool. Idempotent; `num_slots == 0` selects a default.
 /// Must be called off the signal path (it allocates the caches).
 pub fn init(num_slots: usize) {
@@ -165,8 +196,7 @@ fn slots() -> Option<&'static [Slot]> {
 pub fn claim_slot() -> Option<usize> {
     let slots = slots()?;
     for (i, s) in slots.iter().enumerate() {
-        if s
-            .in_use
+        if s.in_use
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
@@ -284,5 +314,8 @@ pub fn with_writer<R>(f: impl FnOnce(&mut Unw) -> R) -> R {
         guard.retired.push(old);
     }
     reclaim(&mut guard);
+    if PUBLISHES.fetch_add(1, Ordering::Relaxed) % CACHE_SWEEP_PERIOD == CACHE_SWEEP_PERIOD - 1 {
+        sweep_slot_caches();
+    }
     ret
 }

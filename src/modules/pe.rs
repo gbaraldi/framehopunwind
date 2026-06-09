@@ -10,7 +10,7 @@
 //! thread, so the (allocating) PE path here is fine — but enumeration must not run while a
 //! target is suspended (loader-lock hazard).
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::ops::Range;
 
 use framehop::{Module, ModuleSectionInfo};
@@ -28,8 +28,8 @@ use crate::state::Bytes;
 // We read its fields by offset (the in-memory image is only byte-aligned).
 const SECTION_HEADER_SIZE: usize = 40;
 
-pub fn enumerate(known: &HashSet<u64>) -> EnumResult {
-    let mut current_keys = HashSet::new();
+pub fn enumerate(known: &HashMap<u64, u64>) -> EnumResult {
+    let mut current = HashMap::new();
     let mut new_modules = Vec::new();
 
     let process = unsafe { GetCurrentProcess() };
@@ -41,24 +41,17 @@ pub fn enumerate(known: &HashSet<u64>) -> EnumResult {
     }
     if needed == 0 {
         return EnumResult {
-            current_keys,
+            current,
             new_modules,
         };
     }
     let count = needed as usize / core::mem::size_of::<HMODULE>();
     let mut handles: Vec<HMODULE> = vec![0 as HMODULE; count];
     let mut needed2: u32 = 0;
-    let ok = unsafe {
-        EnumProcessModules(
-            process,
-            handles.as_mut_ptr(),
-            needed,
-            &mut needed2,
-        )
-    };
+    let ok = unsafe { EnumProcessModules(process, handles.as_mut_ptr(), needed, &mut needed2) };
     if ok == 0 {
         return EnumResult {
-            current_keys,
+            current,
             new_modules,
         };
     }
@@ -80,8 +73,9 @@ pub fn enumerate(known: &HashSet<u64>) -> EnumResult {
         let base = info.lpBaseOfDll as u64;
         let size = info.SizeOfImage as u64;
         let key = base;
-        current_keys.insert(key);
-        if known.contains(&key) {
+        let fp = super::fingerprint_of(&[size], b"");
+        current.insert(key, fp);
+        if known.get(&key) == Some(&fp) {
             continue;
         }
         if let Some(module) = unsafe { build_pe_module(base, size) } {
@@ -90,7 +84,7 @@ pub fn enumerate(known: &HashSet<u64>) -> EnumResult {
     }
 
     EnumResult {
-        current_keys,
+        current,
         new_modules,
     }
 }
@@ -123,8 +117,14 @@ unsafe fn build_pe_module(base: u64, size: u64) -> Option<Module<Bytes>> {
             if section_name_eq(&name, want) {
                 let virtual_size = read_u32(base_ptr, sh_off + 8);
                 let rva = read_u32(base_ptr, sh_off + 12);
-                let size_of_raw_data = read_u32(base_ptr, sh_off + 16);
-                let len = virtual_size.max(size_of_raw_data) as usize;
+                // In the loaded image only the section's *virtual* extent is guaranteed
+                // mapped; SizeOfRawData is a file-alignment quantity that may legally
+                // exceed it, so copying max(virtual, raw) could read past the mapping.
+                // Clamp to the image extent for the (also legal) rva+size > SizeOfImage.
+                let len = (virtual_size as u64).min(size.saturating_sub(rva as u64)) as usize;
+                if len == 0 {
+                    return None;
+                }
                 let bytes = core::slice::from_raw_parts(base_ptr.add(rva as usize), len)
                     .to_vec()
                     .into_boxed_slice();
