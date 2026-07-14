@@ -236,6 +236,8 @@ fn eager_self_backtrace_matches_frame_pointers() {
     );
     #[cfg(target_arch = "x86_64")]
     assert_frames_match("eager", &fh_ips, &fp_rets, 3);
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = fp_rets; // fp oracle is x86_64-only
 }
 
 /// Explicit bounds are honored verbatim: a tiny window truncates the walk cleanly, and
@@ -336,10 +338,15 @@ fn stale_cursor_copy_cannot_release_reclaimed_slot() {
 // and libunwind share) with sentinel values, so silent layout drift fails the tests.
 // ---------------------------------------------------------------------------
 
+// Only Linux and macOS have layout tests below (FreeBSD/Windows would need their own
+// ucontext/CONTEXT fixtures); gate the sentinels to the tests that consume them.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const SENT_IP: u64 = 0x1111_2222_3333_4444;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const SENT_SP: u64 = 0x5555_6666_7777_8888;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const SENT_FP: u64 = 0x9999_aaaa_bbbb_cccc;
-#[cfg(any(target_os = "macos", all(target_os = "linux", target_arch = "aarch64")))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), target_arch = "aarch64"))]
 const SENT_LR: u64 = 0xdddd_eeee_ffff_0123;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

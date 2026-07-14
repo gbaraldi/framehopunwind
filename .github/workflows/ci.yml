@@ -12,6 +12,7 @@ jobs:
   # Full build + unit tests + clippy + the C-ABI smoke test, on both native arches.
   test:
     strategy:
+      fail-fast: false # one platform's failure shouldn't cancel the others' results
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
     runs-on: ${{ matrix.os }}
@@ -47,7 +48,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
-      - run: cargo test -Zbuild-std --target x86_64-unknown-linux-gnu -- concurrent
+      # --lib: skip the (empty) doctest harness, whose unsanitized rustdoc runner crashes
+      # under -Zbuild-std sanitizers.
+      - run: cargo test -Zbuild-std --target x86_64-unknown-linux-gnu --lib -- concurrent
         env:
           RUSTFLAGS: "-Zsanitizer=thread -Cforce-frame-pointers=yes"
 

@@ -12,6 +12,11 @@
 //! memory, and build a framehop module. Section bytes live at `section.addr + slide`; the
 //! un-slid `addr` is the SVMA.
 
+// libc deprecated its Mach-O types (mach_header_64, segment_command_64, ...) in favor of
+// the `mach2` crate. The layouts are ABI-stable and these are our only Mach-O uses, so
+// keep libc's definitions rather than adding a dependency for a handful of structs.
+#![allow(deprecated)]
+
 use std::ops::Range;
 use std::sync::Once;
 
@@ -79,12 +84,10 @@ extern "C" fn on_add_image(header: *const libc::mach_header, slide: libc::intptr
     }
     // SAFETY: dyld passes a valid, mapped image header (and holds its lock for the
     // duration of the callback); we only parse memory the image covers.
-    if let Some((key, fp, module)) =
+    if let Some((key, fp, Some(m))) =
         unsafe { build_image(header as *const libc::mach_header_64, slide as u64) }
     {
-        if let Some(m) = module {
-            super::macos_add_image(key, fp, m);
-        }
+        super::macos_add_image(key, fp, m);
     }
 }
 
@@ -181,8 +184,7 @@ unsafe fn build_image(
                 ));
             }
             // Iterate sections of this segment.
-            let sects = (p as *const u8).add(core::mem::size_of::<libc::segment_command_64>())
-                as *const Section64;
+            let sects = p.add(core::mem::size_of::<libc::segment_command_64>()) as *const Section64;
             for s in 0..seg.nsects {
                 let sec = &*sects.add(s as usize);
                 let svma = Range {
