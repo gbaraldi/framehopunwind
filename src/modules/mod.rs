@@ -20,7 +20,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
 
-use framehop::{Module, Unwinder};
+use framehop::Module;
 
 use crate::state::{self, Bytes};
 
@@ -90,11 +90,16 @@ pub fn init() {
 
 /// Re-scan loaded modules and publish a snapshot reflecting additions, removals, and
 /// changed images (same base, different fingerprint). The JIT modules are preserved.
-/// Off the signal path.
+/// If enumeration fails outright (Windows `EnumProcessModules` can), the previous
+/// snapshot is kept untouched — an empty result must never be mistaken for "everything
+/// was unloaded". Off the signal path.
 #[cfg(not(target_os = "macos"))]
 pub fn refresh() {
     let mut reg = registry();
-    let res = enumerate_static(&reg.static_mods);
+    let res = match enumerate_static(&reg.static_mods) {
+        Some(r) => r,
+        None => return, // enumeration failed; keep the current snapshot
+    };
     let EnumResult {
         current,
         new_modules,
@@ -147,12 +152,13 @@ pub fn refresh() {
 }
 
 /// Enumerate the loaded static modules for this platform, building framehop modules for
-/// any whose `(key, fingerprint)` is not already in `known`.
+/// any whose `(key, fingerprint)` is not already in `known`. Returns `None` if the
+/// enumeration itself failed (as opposed to succeeding with an empty module set).
 #[cfg(not(target_os = "macos"))]
-fn enumerate_static(known: &HashMap<u64, u64>) -> EnumResult {
+fn enumerate_static(known: &HashMap<u64, u64>) -> Option<EnumResult> {
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     {
-        elf::enumerate(known)
+        Some(elf::enumerate(known))
     }
     #[cfg(windows)]
     {
@@ -161,10 +167,10 @@ fn enumerate_static(known: &HashMap<u64, u64>) -> EnumResult {
     #[cfg(not(any(target_os = "linux", target_os = "freebsd", windows)))]
     {
         let _ = known;
-        EnumResult {
+        Some(EnumResult {
             current: HashMap::new(),
             new_modules: Vec::new(),
-        }
+        })
     }
 }
 

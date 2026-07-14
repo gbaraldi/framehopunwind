@@ -139,7 +139,7 @@ fn synthetic_eh_frame(text_lo: u64, text_len: u64) -> Vec<u8> {
 #[cfg(target_arch = "x86_64")]
 fn assert_frames_match(label: &str, fh: &[u64], fp: &[u64], min_frames: usize) {
     assert!(
-        fh.len() >= min_frames + 1,
+        fh.len() > min_frames,
         "{label}: too few frames ({}): {fh:#x?}",
         fh.len()
     );
@@ -293,6 +293,42 @@ fn cursor_init_bounds_clamps_reads() {
     }
 }
 
+/// A byte-for-byte copy of a cursor that is fini'd *after* the original released its slot
+/// (and the slot was possibly re-claimed by a new walk) must be a no-op: the per-claim
+/// nonce is retired at release, so the stale copy loses the release CAS instead of
+/// freeing (or corrupting) the slot's next owner.
+#[test]
+fn stale_cursor_copy_cannot_release_reclaimed_slot() {
+    ensure_init();
+
+    let mut ctx = FhContext::zeroed();
+    capture::fh_capture_context(&mut ctx);
+
+    // Claim a slot with cursor A, then duplicate the raw cursor bytes (what a careless C
+    // caller does with struct assignment).
+    let mut a: FhCursor = unsafe { core::mem::zeroed() };
+    assert_eq!(cursor::cursor_init(&mut a, &ctx), 0);
+    let mut stale: FhCursor = unsafe { core::ptr::read(&a) };
+
+    // Release A; its slot returns to the pool and may be re-claimed by B.
+    cursor::cursor_fini(&mut a);
+    let mut b: FhCursor = unsafe { core::mem::zeroed() };
+    assert_eq!(cursor::cursor_init(&mut b, &ctx), 0);
+
+    // The stale copy still carries A's magic + slot index, but its nonce was retired at
+    // A's fini: this must not release whatever the slot now holds.
+    cursor::cursor_fini(&mut stale);
+
+    // B must still step normally (its slot was not freed under it).
+    let (mut ip, mut sp) = (0u64, 0u64);
+    let rc = cursor::step(&mut b, &mut ip, &mut sp);
+    assert!(
+        rc >= 0 && ip != 0,
+        "B's slot was corrupted by a stale fini: rc={rc} ip={ip:#x}"
+    );
+    cursor::cursor_fini(&mut b);
+}
+
 // ---------------------------------------------------------------------------
 // Context-extraction layout tests: the embedder-facing entry points
 // (fh_context_from_ucontext / fh_context_from_thread_state) are raw-offset reads of OS
@@ -417,7 +453,7 @@ mod jit_path {
             _sz: libc::size_t,
             data: *mut libc::c_void,
         ) -> libc::c_int {
-            unsafe { *(data as *mut u64) = (*info).dlpi_addr as u64 };
+            unsafe { *(data as *mut u64) = (*info).dlpi_addr };
             1 // stop after the main program (first object)
         }
         let mut bias: u64 = u64::MAX;

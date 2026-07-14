@@ -13,6 +13,7 @@ A cursor-based unwinding API mirroring the subset of libunwind Julia uses, plus 
 | `unw_getcontext` / `RtlCaptureContext` | `fh_capture_context` |
 | signal `ucontext_t` / `CONTEXT` | `fh_context_from_ucontext` |
 | `unw_init_local` / `unw_init_local2` | `fh_cursor_init` |
+| *(no equivalent; sampler / task-stack path)* | `fh_cursor_init_bounds` |
 | `unw_get_reg(IP/SP)` + `unw_step` | `fh_step` (output-then-advance) |
 | `_U_dyn_register` / `RtlAddFunctionTable` | `fh_register_jit` / `fh_register_jit_auto` |
 | `_U_dyn_cancel` / `RtlDeleteFunctionTable` | `fh_deregister_jit` / `fh_deregister_jit_eh_frame` |
@@ -32,7 +33,7 @@ The one bounded resource is the cursor **slot pool** (`fh_init(num_slots)`, defa
 
 1. give walks exact bounds — `fh_thread_register` covers same-thread walks on that thread's own pthread stack; for **cross-thread** walks (a sampler unwinding a suspended target) or walks over embedder-managed stacks (e.g. Julia task stacks) the registered bounds *cannot* apply, so pass the target's stack range to `fh_cursor_init_bounds`. With exact bounds, out-of-stack reads become a clean end-of-stack instead of a fault;
 2. call `fh_thread_register` once on every thread that will **run** the unwinder (including sampler/listener threads), off the signal/suspend path — it also pre-faults this library's thread-local storage, whose first access can otherwise allocate (dyld lazy TLV on macOS, `__tls_get_addr` on ELF) at exactly the wrong moment;
-3. always run `fh_cursor_fini` for each successful `fh_cursor_init`, **including on fault recovery** — if a SIGSEGV-recovery `longjmp` skips `fh_cursor_fini`, that slot leaks and the pool eventually drains. Julia is safe here because `jl_set_safe_restore`'s `setjmp` is local to `jl_unw_stepn`, so a caught fault still returns to the caller that runs `fh_cursor_fini`.
+3. always run `fh_cursor_fini` for each successful `fh_cursor_init`, **including on fault recovery** — if a SIGSEGV-recovery `longjmp` skips `fh_cursor_fini`, that slot leaks and the pool eventually drains. Julia is safe here because `jl_set_safe_restore`'s `setjmp` is local to `jl_unw_stepn`, so a caught fault still returns to the caller that runs `fh_cursor_fini`. Note also that such a `longjmp` crosses this library's Rust frames, which is defined behavior only while those frames hold no pending destructors — the read path is written allocation- and destructor-free to keep that true, but exact bounds (which avoid the fault entirely) are the *supported* configuration and the `longjmp` path is best-effort.
 
 See the header for the full contract.
 
@@ -50,7 +51,7 @@ framehop is x86_64 + aarch64 only, and its PE backend is x86_64-only.
 
 `fh_supported()` / `FRAMEHOP_SUPPORTED` reports whether the current build can unwind natively; on unsupported targets every entry point is a no-op stub returning failure, so a caller can always link the library and gate at the call site.
 
-**Verified in this repo:** Linux x86_64 is built and unit-tested (eager self-backtrace cross-checked against a frame-pointer walk; JIT `.eh_frame` unwinding of real code; a concurrent register/unwind stress test). aarch64-linux, x86_64-freebsd, macOS (both arches), and x86_64-windows-gnu are cross-compile-checked.
+**Verified in CI** (`.github/workflows/ci.yml`): Linux x86_64 + aarch64 and macOS are built and unit-tested (eager self-backtrace cross-checked against a frame-pointer walk; JIT `.eh_frame` unwinding of real code; a concurrent register/unwind stress test, also run under ThreadSanitizer) plus a C smoke test through the public header and cdylib (`tests/run_c_smoke.sh`). FreeBSD and Windows (gnu + msvc) are cross-compile-checked, and the declared MSRV (1.88) is build-checked.
 
 ## Design notes
 
@@ -67,7 +68,7 @@ cargo test                 # host unit/integration tests (Linux x86_64)
 
 ## Julia integration
 
-The patch in [`julia-framehop-integration.patch`](julia-framehop-integration.patch) is **additive and gated**: with `JL_USE_FRAMEHOP` undefined the Julia build is byte-for-byte unchanged. It is enabled by defining `JL_ENABLE_FRAMEHOP` at build time; `JL_USE_FRAMEHOP` is then derived only for Linux/FreeBSD on x86_64/aarch64 (extend the predicate in `julia_internal.h` as more platforms are validated).
+The integration lives on the JuliaLang julia branch [`gb/framehop-unwinder`](https://github.com/JuliaLang/julia/tree/gb/framehop-unwinder) (wired up via `deps/framehopunwind.mk`; an earlier snapshot existed here as `julia-framehop-integration.patch`, dropped in `2dacae3`). It is **additive and gated**: with `JL_USE_FRAMEHOP` undefined the Julia build is byte-for-byte unchanged. It is enabled by defining `JL_ENABLE_FRAMEHOP` at build time; `JL_USE_FRAMEHOP` is then derived only for Linux/FreeBSD on x86_64/aarch64 (extend the predicate in `julia_internal.h` as more platforms are validated).
 
 What it changes (Linux/FreeBSD scope):
 
@@ -77,7 +78,7 @@ What it changes (Linux/FreeBSD scope):
 * `init.c` / `threading.c` — `fh_init(0)` at startup and `fh_thread_register()` per thread.
 * `dlload.c` — `fh_modules_refresh()` after a successful `dlopen`.
 
-Build glue (implemented in the patch via a `src/Makefile` block): build Julia with
+Build glue (implemented on the branch via a `src/Makefile` block): build Julia with
 
 ```sh
 make -j JULIA_FRAMEHOP=/abs/path/to/framehopunwind
@@ -92,7 +93,7 @@ release this would become a `LibFramehopUnwind_jll` linked **alongside** `LibUnw
 > Note: on x86_64/aarch64 Linux/FreeBSD, libunwind is *not* strictly required once
 > backtraces use framehop — `task.c` context-switching uses hand-written asm
 > (`JL_TASK_SWITCH_ASM`), and `debuginfo.cpp`'s `unw_get_proc_info_by_ip` is only a
-> symbol-lookup fast path with dladdr/LLVM fallbacks. This patch keeps libunwind linked as
+> symbol-lookup fast path with dladdr/LLVM fallbacks. The branch keeps libunwind linked as
 > the conservative first step; it could be dropped on these targets in a follow-up.
 
 ## License

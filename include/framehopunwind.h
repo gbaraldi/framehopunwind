@@ -33,6 +33,13 @@
  * fault. This crate does NOT install its own SIGSEGV handler (it would conflict with the
  * embedder's, e.g. Julia's).
  *
+ * If the embedder instead survives a faulting read by longjmp/siglongjmp-ing out of
+ * fh_step from its SIGSEGV handler (Julia's jl_set_safe_restore), be aware the jump
+ * crosses this library's (Rust) frames. That is defined behavior only while those frames
+ * hold no pending destructors; the read path is written allocation- and destructor-free
+ * to keep that true, but exact bounds — which avoid the fault entirely — are the
+ * *supported* configuration, and the longjmp path is best-effort.
+ *
  * fh_thread_register also pre-faults this library's thread-local storage. Any thread
  * that will RUN the unwinder (including sampler/listener threads that only ever unwind
  * *other* threads) must call it once off the signal/suspend path: the first TLS access
@@ -42,6 +49,13 @@
  * A cursor owns a pooled slot (a preallocated unwind cache) from fh_cursor_init until
  * fh_cursor_fini. The pool is finite (fh_init's num_slots); if it is exhausted
  * fh_cursor_init returns <0 (skip that sample) — it never blocks or allocates.
+ *
+ * A cursor is single-owner: do not copy the struct, share it across threads, or step it
+ * concurrently. (Defense-in-depth: each cursor carries a per-claim nonce, so fini on a
+ * stale copy — or a double fini racing the slot's next owner — degrades to a no-op
+ * instead of corrupting another walk; do not rely on this.) fh_cursor_init on a cursor
+ * that is still live does NOT release the old slot (it never reads the caller's possibly
+ * uninitialized memory) — fini first, or the slot leaks.
  *
  * Therefore the caller MUST guarantee fh_cursor_fini runs for every successful
  * fh_cursor_init, INCLUDING on any fault-recovery path. If you rely on a SIGSEGV handler
@@ -56,6 +70,7 @@
  *   unw_getcontext / RtlCaptureContext      -> fh_capture_context
  *   (signal ucontext_t / CONTEXT)           -> fh_context_from_ucontext
  *   unw_init_local / unw_init_local2        -> fh_cursor_init
+ *   (no libunwind equivalent; sampler path) -> fh_cursor_init_bounds
  *   unw_get_reg(IP/SP) + unw_step           -> fh_step  (output-then-advance)
  *   _U_dyn_register / RtlAddFunctionTable   -> fh_register_jit
  *   _U_dyn_cancel   / RtlDeleteFunctionTable-> fh_deregister_jit

@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Full build + unit tests + clippy + the C-ABI smoke test, on both native arches.
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo build --release
+      - run: cargo test
+      - run: cargo clippy --all-targets -- -D warnings
+      - name: C smoke test (public header + cdylib through the real C ABI)
+        run: sh tests/run_c_smoke.sh
+
+  # The declared rust-version must actually build the crate.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+      - run: cargo check --all-targets
+
+  # The hazard-pointer snapshot protocol under ThreadSanitizer (see the concurrent
+  # register/unwind stress test). Nightly-only (-Zsanitizer / -Zbuild-std). Frame
+  # pointers are re-forced because the RUSTFLAGS env override replaces
+  # .cargo/config.toml's rustflags.
+  tsan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - run: cargo test -Zbuild-std --target x86_64-unknown-linux-gnu -- concurrent
+        env:
+          RUSTFLAGS: "-Zsanitizer=thread -Cforce-frame-pointers=yes"
+
+  # Every supported (os, arch) must at least typecheck; `cargo check` does not link, so
+  # no cross SDKs are needed.
+  cross-check:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - aarch64-unknown-linux-gnu
+          - x86_64-unknown-freebsd
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+          - x86_64-pc-windows-gnu
+          - x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo check --target ${{ matrix.target }}

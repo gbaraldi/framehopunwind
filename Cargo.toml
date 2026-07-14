@@ -2,9 +2,10 @@
 name = "framehopunwind"
 version = "0.1.0"
 edition = "2021"
-# Cargo.lock is lockfile v4, which needs cargo >= 1.78; declare it so older toolchains
-# fail with a clear message instead of a cryptic lockfile error.
-rust-version = "1.78"
+# Highest MSRV among our language/std features: naked functions (`#[unsafe(naked)]` +
+# `naked_asm!` in capture.rs) stabilized in 1.88. (LazyLock needs 1.80, lockfile v4 needs
+# cargo >= 1.78.) Declared so older toolchains fail with a clear message.
+rust-version = "1.88"
 description = "A clean C unwinding API backed by framehop, with JIT registration, intended to replace libunwind/dbghelp in Julia."
 license = "MIT OR Apache-2.0"
 publish = false
@@ -36,6 +37,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Kernel",
+    "Win32_System_LibraryLoader",
     "Win32_System_Threading",
     "Win32_System_ProcessStatus",
     "Win32_System_SystemInformation",

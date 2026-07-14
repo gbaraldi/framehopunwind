@@ -6,29 +6,46 @@
 //! current frame's ip/sp, then advances** the cursor, returning `>0` if a further frame
 //! exists, `0` at a clean end, `<0` on error.
 //!
+//! All entry points take **raw pointers** and copy the cursor in/out with `ptr::read` /
+//! `ptr::write` rather than forming `&`/`&mut` references over caller memory: the C
+//! caller's `fh_cursor` starts out uninitialized, and nothing stops a C caller from
+//! passing aliased output pointers (`ip == sp`), so references would assert validity and
+//! exclusivity guarantees the FFI boundary cannot provide.
+//!
+//! A cursor carries a per-claim **nonce** checked against the slot's claim sequence on
+//! every access, so a stale cursor (a struct copy fini'd twice, or use after the slot was
+//! recycled) degrades to a no-op / error instead of corrupting the slot's next owner.
+//!
 //! # Fault & slot-lifetime contract
 //!
 //! `fh_step`'s stack reads are bounds-checked but only *fault-bounded*: with the
 //! sp-derived fallback window (a thread that did not call `fh_thread_register`) a bad
 //! address can still hit `SIGSEGV`. We deliberately do **not** install a `SIGSEGV` handler
-//! (it would conflict with the embedder's). Two consequences the caller must respect:
+//! (it would conflict with the embedder's). Three consequences the caller must respect:
 //!
-//!  1. To make reads fault-free, register every unwound thread (`fh_thread_register`) so
-//!     `read_stack` has the exact mapped stack bounds; out-of-stack reads then become a
-//!     clean end-of-stack instead of a fault.
-//!  2. A cursor holds a pooled slot from [`cursor_init`] until [`cursor_fini`]. The caller
+//!  1. To make reads fault-free, give every walk exact mapped bounds (register the thread,
+//!     or pass the target's stack range to [`cursor_init_bounds`]); out-of-stack reads
+//!     then become a clean end-of-stack instead of a fault.
+//!  2. If the embedder instead recovers from a faulting read by `longjmp`ing out of
+//!     `fh_step` (Julia's `jl_set_safe_restore`), note that the jump crosses this
+//!     library's Rust frames. That is only defined behavior while those frames have no
+//!     pending destructors ("plain old frames", RFC 2945); the read path is written
+//!     allocation- and destructor-free to keep that true, but exact bounds — which avoid
+//!     the fault entirely — are the *supported* configuration, and the longjmp path is
+//!     best-effort.
+//!  3. A cursor holds a pooled slot from [`cursor_init`] until [`cursor_fini`]. The caller
 //!     MUST run `cursor_fini` for every successful init, **including on a fault-recovery
-//!     path**. If a bad read faults and the embedder recovers via a `longjmp` out of
-//!     `fh_step`, that `longjmp`'s target must sit at or below the stepping scope so
-//!     `cursor_fini` still runs afterwards — otherwise the slot leaks and, over repeated
+//!     path** — the `longjmp` target must sit at or below the stepping scope so
+//!     `cursor_fini` still runs afterwards; otherwise the slot leaks and, over repeated
 //!     faults, the fixed pool drains and later `cursor_init`s fail (backtraces silently
 //!     stop). Julia satisfies this: `jl_set_safe_restore`'s `setjmp` is local to
 //!     `jl_unw_stepn`, so a caught fault returns from it and the caller still runs
-//!     `fh_cursor_fini`.
+//!     `fh_cursor_fini`. Note `cursor_init` on a still-live cursor does NOT release the
+//!     old slot (it cannot read the old contents safely); fini first.
 
 use core::ffi::c_int;
 
-use framehop::{Error, FrameAddress, Unwinder};
+use framehop::{FrameAddress, Unwinder};
 
 use crate::arch::{self, FhContext};
 use crate::state::{self, Snapshot};
@@ -37,15 +54,19 @@ use crate::state::{self, Snapshot};
 const CURSOR_MAGIC: u64 = 0x46_48_43_55_52_53_00_01; // "FHCURS\0\x01"
 
 /// Caller-allocated opaque cursor. Must be at least this size; the C header sizes it
-/// generously. We only store an index + magic; the heavy state lives in the slot.
+/// generously. We only store an index + magic + claim nonce; the heavy state lives in
+/// the slot.
 #[repr(C)]
 pub struct FhCursor {
     magic: u64,
     slot: u64,
+    /// The claim nonce returned by [`state::claim_slot`]; must still match the slot's
+    /// claim sequence for this cursor to count as the slot's live owner.
+    nonce: u64,
     /// Reserved padding to fix the opaque-cursor ABI at 64 bytes (must match
     /// `fh_cursor` in the C header). Not currently used; all per-walk state lives in the
     /// pooled `SlotInner`.
-    _reserved: [u64; 6],
+    _reserved: [u64; 5],
 }
 
 // Compile-time ABI lock: the C header hard-codes these layouts (fh_cursor as
@@ -60,14 +81,22 @@ const _: () = {
 };
 
 impl FhCursor {
+    /// The canonical "not a live cursor" value, written on init failure and fini.
     #[inline]
-    fn invalidate(&mut self) {
-        self.magic = 0;
-        self.slot = u64::MAX;
+    fn dead() -> Self {
+        FhCursor {
+            magic: 0,
+            slot: u64::MAX,
+            nonce: 0,
+            _reserved: [0; 5],
+        }
     }
+    /// Live check: magic + slot index + claim nonce must all still hold.
     #[inline]
     fn is_live(&self) -> bool {
-        self.magic == CURSOR_MAGIC && self.slot != u64::MAX
+        self.magic == CURSOR_MAGIC
+            && self.slot != u64::MAX
+            && state::nonce_matches(self.slot as usize, self.nonce)
     }
 }
 
@@ -97,10 +126,14 @@ fn stack_window(sp: u64) -> (u64, u64) {
     }
 }
 
-/// Initialize `cur` to unwind starting from `ctx`. Async-signal-safe.
+/// Initialize `*cur` to unwind starting from `*ctx`. Async-signal-safe.
 ///
 /// Returns 0 on success, `<0` on failure (no published modules, or no free slot).
-pub fn cursor_init(cur: &mut FhCursor, ctx: &FhContext) -> c_int {
+///
+/// # Safety (crate-internal contract)
+/// `cur` and `ctx` are non-null (checked by the FFI layer) and point at caller-allocated
+/// storage of the right size/alignment. `*cur` may be uninitialized; it is only written.
+pub fn cursor_init(cur: *mut FhCursor, ctx: *const FhContext) -> c_int {
     cursor_init_bounds(cur, ctx, 0, 0)
 }
 
@@ -111,20 +144,27 @@ pub fn cursor_init(cur: &mut FhCursor, ctx: &FhContext) -> c_int {
 /// range) falls back to the registered-bounds / sp-window heuristic. Async-signal-safe
 /// (explicit bounds skip even the thread-local lookup).
 pub fn cursor_init_bounds(
-    cur: &mut FhCursor,
-    ctx: &FhContext,
+    cur: *mut FhCursor,
+    ctx: *const FhContext,
     stack_lo: u64,
     stack_hi: u64,
 ) -> c_int {
-    cur.invalidate();
+    // Write-only teardown of whatever was in *cur (possibly uninitialized C stack
+    // memory — never read it). A still-live cursor's slot is NOT released here; that
+    // would require reading potentially-uninitialized memory. Fini before re-init.
+    // SAFETY: cur is valid for writes (FFI layer null-checked; caller sized it).
+    unsafe { cur.write(FhCursor::dead()) };
+    // SAFETY: ctx is a valid, fully initialized FhContext (all five words are written by
+    // every capture/extraction path).
+    let ctx: FhContext = unsafe { ctx.read() };
 
-    let slot_idx = match state::claim_slot() {
-        Some(i) => i,
+    let (slot_idx, nonce) = match state::claim_slot() {
+        Some(c) => c,
         None => return -1, // pool exhausted; skip this sample
     };
     let snap = state::acquire_snapshot(slot_idx);
     if snap.is_null() {
-        state::release_slot(slot_idx);
+        state::release_slot(slot_idx, nonce);
         return -2; // nothing registered yet
     }
 
@@ -133,7 +173,7 @@ pub fn cursor_init_bounds(
     let max_code = unsafe { (*snap).max_code_addr };
     let mask = ptr_auth_mask(max_code);
 
-    let sp0 = arch::context_sp(ctx);
+    let sp0 = arch::context_sp(&ctx);
     let (lo, hi) = if stack_lo < stack_hi {
         (stack_lo, stack_hi) // explicit, trusted verbatim; no TLS touched
     } else {
@@ -144,22 +184,29 @@ pub fn cursor_init_bounds(
     let slot = match state::slot(slot_idx) {
         Some(s) => s,
         None => {
-            state::release_slot(slot_idx);
+            state::release_slot(slot_idx, nonce);
             return -3;
         }
     };
     // SAFETY: we exclusively own the slot (won the claim CAS).
     let inner = unsafe { slot.inner_mut() };
-    inner.regs = arch::make_regs(ctx, mask);
-    inner.cur_addr = arch::initial_frame_address(ctx);
-    inner.cur_ip = arch::context_ip(ctx);
+    inner.regs = arch::make_regs(&ctx, mask);
+    inner.cur_addr = arch::initial_frame_address(&ctx);
+    inner.cur_ip = arch::context_ip(&ctx);
     inner.done = false;
     inner.snapshot = snap;
     inner.stack_lo = lo;
     inner.stack_hi = hi;
 
-    cur.magic = CURSOR_MAGIC;
-    cur.slot = slot_idx as u64;
+    // SAFETY: cur is valid for writes (see above).
+    unsafe {
+        cur.write(FhCursor {
+            magic: CURSOR_MAGIC,
+            slot: slot_idx as u64,
+            nonce,
+            _reserved: [0; 5],
+        });
+    }
     0
 }
 
@@ -182,22 +229,28 @@ fn ptr_auth_mask(_max_code: u64) -> u64 {
     u64::MAX
 }
 
-/// Advance one frame. Outputs the current frame's ip/sp into `*ip`/`*sp`, then steps to
-/// the caller. Returns `>0` if a further frame exists, `0` at end, `<0` on error.
-/// Async-signal-safe.
-pub fn step(cur: &mut FhCursor, out_ip: &mut u64, out_sp: &mut u64) -> c_int {
-    *out_ip = 0;
-    *out_sp = 0;
-    if !cur.is_live() {
+/// Advance one frame. Outputs the current frame's ip/sp into `*out_ip`/`*out_sp`, then
+/// steps to the caller. Returns `>0` if a further frame exists, `0` at end, `<0` on
+/// error. Async-signal-safe. Output pointers are written through raw writes, so aliased
+/// outputs (`out_ip == out_sp`) are last-write-wins rather than undefined behavior.
+pub fn step(cur: *mut FhCursor, out_ip: *mut u64, out_sp: *mut u64) -> c_int {
+    // SAFETY: non-null (FFI layer) and valid for writes per the C contract.
+    unsafe {
+        out_ip.write(0);
+        out_sp.write(0);
+    }
+    // SAFETY: cur is non-null; copy it out so later output writes cannot alias our view.
+    let c: FhCursor = unsafe { cur.read() };
+    if !c.is_live() {
         return -1;
     }
-    let slot_idx = cur.slot as usize;
+    let slot_idx = c.slot as usize;
     let slot = match state::slot(slot_idx) {
         Some(s) => s,
         None => return -1,
     };
-    // SAFETY: this cursor exclusively owns the slot until fini. We hold a single `&mut`
-    // and split it into disjoint field borrows below (never two refs to the same field).
+    // SAFETY: this cursor is the slot's live owner (nonce checked) until fini. We hold a
+    // single `&mut` and split it into disjoint field borrows below.
     let inner = unsafe { slot.inner_mut() };
     if inner.done {
         return 0;
@@ -207,8 +260,11 @@ pub fn step(cur: &mut FhCursor, out_ip: &mut u64, out_sp: &mut u64) -> c_int {
     }
 
     // Output the CURRENT frame first (matches jl_unw_step semantics).
-    *out_ip = inner.cur_ip;
-    *out_sp = inner.regs.sp();
+    // SAFETY: valid for writes (see above).
+    unsafe {
+        out_ip.write(inner.cur_ip);
+        out_sp.write(inner.regs.sp());
+    }
 
     // SAFETY: `snapshot` is hazard-protected for this slot until fini.
     let snap: &Snapshot = unsafe { &*inner.snapshot };
@@ -255,37 +311,52 @@ pub fn step(cur: &mut FhCursor, out_ip: &mut u64, out_sp: &mut u64) -> c_int {
             inner.done = true;
             0 // reached root; current frame already emitted
         }
-        Err(e) => {
+        // Any unwind error — including a bad stack read (Error::CouldNotReadStack) — is
+        // reported as a normal truncation: the frames emitted so far are valid, and the
+        // caller cannot do anything more useful with a distinction here.
+        Err(_) => {
             inner.done = true;
-            match e {
-                // A bad stack read is a normal truncation, not a hard error.
-                Error::CouldNotReadStack(_) | Error::ReturnAddressIsNull => 0,
-                _ => 0,
-            }
+            0
         }
     }
 }
 
 /// Read the current ip/sp without advancing (mirrors `jl_unw_get` on an initialized
-/// cursor). Safe to call after init and between steps.
-pub fn get_reg(cur: &FhCursor, out_ip: &mut u64, out_sp: &mut u64) {
-    *out_ip = 0;
-    *out_sp = 0;
-    if !cur.is_live() {
+/// cursor). Safe to call after init and between steps. Read-only: takes only a shared
+/// view of the slot state, so it never manufactures a `&mut` from a `const fh_cursor *`.
+pub fn get_reg(cur: *const FhCursor, out_ip: *mut u64, out_sp: *mut u64) {
+    // SAFETY: non-null (FFI layer) and valid for writes per the C contract.
+    unsafe {
+        out_ip.write(0);
+        out_sp.write(0);
+    }
+    // SAFETY: cur is non-null; copy out (see `step`).
+    let c: FhCursor = unsafe { cur.read() };
+    if !c.is_live() {
         return;
     }
-    if let Some(slot) = state::slot(cur.slot as usize) {
-        // SAFETY: owned by this cursor.
-        let inner = unsafe { slot.inner_mut() };
-        *out_ip = inner.cur_ip;
-        *out_sp = inner.regs.sp();
+    if let Some(slot) = state::slot(c.slot as usize) {
+        // SAFETY: owned by this cursor; no `&mut` is live (single-owner contract, and
+        // `step`'s exclusive borrow ends before it returns).
+        let inner = unsafe { slot.inner_ref() };
+        // SAFETY: valid for writes (see above).
+        unsafe {
+            out_ip.write(inner.cur_ip);
+            out_sp.write(inner.regs.sp());
+        }
     }
 }
 
-/// Release the cursor's slot. Idempotent; async-signal-safe.
-pub fn cursor_fini(cur: &mut FhCursor) {
-    if cur.is_live() {
-        state::release_slot(cur.slot as usize);
+/// Release the cursor's slot. Idempotent (the release CAS makes a stale or repeated fini
+/// a no-op); async-signal-safe.
+pub fn cursor_fini(cur: *mut FhCursor) {
+    // SAFETY: cur is non-null (FFI layer).
+    let c: FhCursor = unsafe { cur.read() };
+    if c.magic == CURSOR_MAGIC && c.slot != u64::MAX {
+        // release_slot verifies the nonce by CAS, so a stale copy cannot free the slot's
+        // next owner.
+        state::release_slot(c.slot as usize, c.nonce);
     }
-    cur.invalidate();
+    // SAFETY: valid for writes.
+    unsafe { cur.write(FhCursor::dead()) };
 }

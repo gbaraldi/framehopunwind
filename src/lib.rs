@@ -28,8 +28,6 @@
 //! targets (32-bit, Windows-aarch64, ppc64le, …) are not handled by framehop; callers
 //! gate on [`fh_supported`] / `FRAMEHOP_SUPPORTED` and keep the existing unwinder.
 
-extern crate alloc;
-
 use core::ffi::{c_int, c_void};
 
 // Core machinery only exists for the arches framehop supports.
@@ -152,7 +150,9 @@ mod api {
         if ctx.is_null() {
             return;
         }
-        // SAFETY: ctx is a valid, caller-allocated FhContext.
+        // SAFETY: ctx is valid caller-allocated storage; fully initialize it through a
+        // raw write BEFORE forming a Rust reference (the caller's struct may be uninit).
+        unsafe { ctx.write(FhContext::zeroed()) };
         let ctx = unsafe { &mut *ctx };
         crate::capture::context_from_os(ctx, os_ctx);
     }
@@ -164,21 +164,20 @@ mod api {
         if ctx.is_null() {
             return;
         }
-        // SAFETY: ctx is a valid, caller-allocated FhContext.
+        // SAFETY: see fh_context_from_ucontext — raw write before forming a reference.
+        unsafe { ctx.write(FhContext::zeroed()) };
         let ctx = unsafe { &mut *ctx };
         crate::capture::context_from_thread_state(ctx, ts);
     }
 
     /// Initialize `cur` to unwind from `ctx`. Returns 0 on success, `<0` on failure (no
     /// modules published, or the slot pool is exhausted). Async-signal-safe.
+    /// (`cur` may be uninitialized storage; the cursor layer only writes it.)
     #[no_mangle]
     pub extern "C" fn fh_cursor_init(cur: *mut FhCursor, ctx: *const FhContext) -> c_int {
         if cur.is_null() || ctx.is_null() {
             return -100;
         }
-        // SAFETY: caller-allocated, correctly sized (see FH_CURSOR_SIZE in the header).
-        let cur = unsafe { &mut *cur };
-        let ctx = unsafe { &*ctx };
         crate::cursor::cursor_init(cur, ctx)
     }
 
@@ -198,22 +197,18 @@ mod api {
         if cur.is_null() || ctx.is_null() {
             return -100;
         }
-        // SAFETY: caller-allocated, correctly sized (see FH_CURSOR_SIZE in the header).
-        let cur = unsafe { &mut *cur };
-        let ctx = unsafe { &*ctx };
         crate::cursor::cursor_init_bounds(cur, ctx, stack_lo, stack_hi)
     }
 
     /// Output the current frame's ip/sp into `*ip`/`*sp`, then advance one frame.
     /// Returns `>0` if more frames may follow, `0` at a clean end, `<0` on error.
-    /// Async-signal-safe.
+    /// Async-signal-safe. (Outputs are written through raw pointers, so `ip == sp`
+    /// aliasing is tolerated.)
     #[no_mangle]
     pub extern "C" fn fh_step(cur: *mut FhCursor, ip: *mut u64, sp: *mut u64) -> c_int {
         if cur.is_null() || ip.is_null() || sp.is_null() {
             return -100;
         }
-        // SAFETY: all three are valid caller pointers.
-        let (cur, ip, sp) = unsafe { (&mut *cur, &mut *ip, &mut *sp) };
         crate::cursor::step(cur, ip, sp)
     }
 
@@ -223,8 +218,6 @@ mod api {
         if cur.is_null() || ip.is_null() || sp.is_null() {
             return;
         }
-        // SAFETY: valid caller pointers.
-        let (cur, ip, sp) = unsafe { (&*cur, &mut *ip, &mut *sp) };
         crate::cursor::get_reg(cur, ip, sp);
     }
 
@@ -235,8 +228,6 @@ mod api {
         if cur.is_null() {
             return;
         }
-        // SAFETY: valid caller pointer.
-        let cur = unsafe { &mut *cur };
         crate::cursor::cursor_fini(cur);
     }
 
@@ -293,6 +284,14 @@ mod api_stub {
     pub extern "C" fn fh_thread_register() {}
     #[no_mangle]
     pub extern "C" fn fh_modules_refresh() {}
+    #[no_mangle]
+    pub extern "C" fn fh_jit_module_count() -> usize {
+        0
+    }
+    #[no_mangle]
+    pub extern "C" fn fh_jit_register_failures() -> usize {
+        0
+    }
     #[no_mangle]
     pub extern "C" fn fh_context_from_ucontext(_ctx: *mut c_void, _os_ctx: *const c_void) {}
     #[no_mangle]

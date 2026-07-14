@@ -15,6 +15,10 @@ use crate::arch::FhContext;
 cfg_if::cfg_if! {
     if #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))] {
         /// Capture the current (caller's) context into `*ctx`. SysV: arg in `rdi`.
+        ///
+        /// Writes ALL five context words (zeroing the unused ones): C callers pass a
+        /// stack-allocated `fh_context`, and Rust later forms references to it, so no
+        /// word may be left uninitialized.
         #[no_mangle]
         #[unsafe(naked)]
         pub extern "C" fn fh_capture_context(ctx: *mut FhContext) {
@@ -24,11 +28,13 @@ cfg_if::cfg_if! {
                 "lea rax, [rsp + 8]", // caller's sp (after the call returns)
                 "mov [rdi + 8], rax",
                 "mov [rdi + 16], rbp",// caller's frame pointer
+                "mov qword ptr [rdi + 24], 0", // r[3] unused on x86_64
+                "mov qword ptr [rdi + 32], 0", // r[4] reserved
                 "ret",
             )
         }
     } else if #[cfg(all(target_arch = "x86_64", target_os = "windows"))] {
-        /// Win64: first arg in `rcx`.
+        /// Win64: first arg in `rcx`. Writes all five words (see the SysV variant).
         #[no_mangle]
         #[unsafe(naked)]
         pub extern "C" fn fh_capture_context(ctx: *mut FhContext) {
@@ -38,11 +44,14 @@ cfg_if::cfg_if! {
                 "lea rax, [rsp + 8]",
                 "mov [rcx + 8], rax",
                 "mov [rcx + 16], rbp",
+                "mov qword ptr [rcx + 24], 0",
+                "mov qword ptr [rcx + 32], 0",
                 "ret",
             )
         }
     } else if #[cfg(target_arch = "aarch64")] {
         /// AAPCS64: arg in `x0`. r[0]=pc, r[1]=sp, r[2]=fp(x29), r[3]=lr(x30).
+        /// Writes all five words (see the SysV variant).
         #[no_mangle]
         #[unsafe(naked)]
         pub extern "C" fn fh_capture_context(ctx: *mut FhContext) {
@@ -52,6 +61,7 @@ cfg_if::cfg_if! {
                 "str x1, [x0, #8]",    // sp
                 "str x29, [x0, #16]",  // fp
                 "str x30, [x0, #24]",  // lr (== return address; unused for first frame)
+                "str xzr, [x0, #32]",  // r[4] reserved
                 "ret",
             )
         }

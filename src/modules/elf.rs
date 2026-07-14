@@ -85,7 +85,7 @@ extern "C" fn callback(
     let info = unsafe { &*info };
     let collector = unsafe { &mut *(data as *mut Collector) };
 
-    let bias = info.dlpi_addr as u64;
+    let bias = info.dlpi_addr;
     if info.dlpi_phdr.is_null() || info.dlpi_phnum == 0 {
         return 0;
     }
@@ -100,8 +100,8 @@ extern "C" fn callback(
     for ph in phdrs {
         match ph.p_type {
             PT_LOAD => {
-                let lo = bias + ph.p_vaddr as u64;
-                let hi = lo + ph.p_memsz as u64;
+                let lo = bias + ph.p_vaddr;
+                let hi = lo + ph.p_memsz;
                 if lo < avma_lo {
                     avma_lo = lo;
                 }
@@ -110,8 +110,8 @@ extern "C" fn callback(
                 }
                 if (ph.p_flags & PF_X) != 0 && text_svma.is_none() {
                     text_svma = Some(Range {
-                        start: ph.p_vaddr as u64,
-                        end: ph.p_vaddr as u64 + ph.p_memsz as u64,
+                        start: ph.p_vaddr,
+                        end: ph.p_vaddr + ph.p_memsz,
                     });
                 }
             }
@@ -135,7 +135,7 @@ extern "C" fn callback(
         unsafe { CStr::from_ptr(info.dlpi_name) }.to_bytes()
     };
     let (hdr_vaddr, hdr_memsz) = match hdr_phdr {
-        Some(p) => (p.p_vaddr as u64, p.p_memsz as u64),
+        Some(p) => (p.p_vaddr, p.p_memsz),
         None => (0, 0),
     };
     let fp = super::fingerprint_of(&[hdr_vaddr, hdr_memsz, avma_hi - avma_lo], name_bytes);
@@ -152,7 +152,7 @@ extern "C" fn callback(
         None => return 0, // no unwind info; framehop will fp-fallback for this module
     };
 
-    let hdr_avma = bias + hdr_phdr.p_vaddr as u64;
+    let hdr_avma = bias + hdr_phdr.p_vaddr;
     let hdr_len = hdr_phdr.p_memsz as usize;
     if hdr_len < 4 {
         return 0;
@@ -221,8 +221,8 @@ fn containing_segment_end(phdrs: &[libc::Elf64_Phdr], bias: u64, addr: u64) -> O
         if ph.p_type != PT_LOAD {
             continue;
         }
-        let lo = bias + ph.p_vaddr as u64;
-        let hi = lo + ph.p_memsz as u64;
+        let lo = bias + ph.p_vaddr;
+        let hi = lo + ph.p_memsz;
         if addr >= lo && addr < hi {
             return Some(hi);
         }
