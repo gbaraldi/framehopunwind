@@ -12,9 +12,8 @@
 //! memory, and build a framehop module. Section bytes live at `section.addr + slide`; the
 //! un-slid `addr` is the SVMA.
 
-// libc deprecated its Mach-O types (mach_header_64, segment_command_64, ...) in favor of
-// the `mach2` crate. The layouts are ABI-stable and these are our only Mach-O uses, so
-// keep libc's definitions rather than adding a dependency for a handful of structs.
+// libc deprecated its Mach-O types in favor of the `mach2` crate; the layouts are
+// ABI-stable, so keep them rather than add a dependency for a few structs.
 #![allow(deprecated)]
 
 use std::ops::Range;

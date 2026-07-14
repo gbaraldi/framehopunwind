@@ -1,7 +1,6 @@
 #!/bin/sh
-# Build the release cdylib, compile tests/c_smoke.c against the public header, and run
-# it — this is the only test that exercises the real C ABI surface (including the
-# header's static_asserts under a C compiler). Unix-only; CI runs it on Linux.
+# Build the release cdylib, compile tests/c_smoke.c against the public header, run it —
+# the only test exercising the real C ABI (incl. the header's static_asserts). Unix-only.
 set -eu
 cd "$(dirname "$0")/.."
 

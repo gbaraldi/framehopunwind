@@ -74,10 +74,8 @@ pub struct SlotInner {
 pub struct Slot {
     /// Claimed exclusively by one cursor for the duration of a stack walk.
     pub in_use: AtomicBool,
-    /// Claim sequence number, bumped on every claim AND every release. A cursor records
-    /// the value observed at claim time as its nonce; any later use of a stale cursor
-    /// (a copied struct, a double-fini after the slot was re-claimed) sees a mismatched
-    /// seq and becomes a no-op instead of corrupting the slot's new owner.
+    /// Claim sequence, bumped on every claim and release. A cursor keeps the claim-time
+    /// value as its nonce; a stale cursor (copy, double-fini) mismatches and no-ops.
     pub seq: AtomicU64,
     /// The snapshot pointer this slot is currently protecting from reclamation.
     pub hazard: AtomicPtr<Snapshot>,
@@ -103,20 +101,17 @@ impl Slot {
     ///
     /// # Safety
     /// The caller must hold this slot (won its `in_use` CAS) and must not alias.
-    // clippy::mut_from_ref is deny-by-default because &self -> &mut is usually a bug;
-    // here the exclusivity clippy cannot see is provided by the `in_use` CAS (exactly the
-    // UnsafeCell interior-mutability pattern the lint carves out for cell types).
+    // mut_from_ref: exclusivity clippy can't see is provided by the `in_use` CAS.
     #[allow(clippy::mut_from_ref)]
     #[inline]
     pub unsafe fn inner_mut(&self) -> &mut SlotInner {
         &mut *self.inner.get()
     }
 
-    /// Get shared access to the slot's inner state (for read-only peeks like `fh_get_reg`).
+    /// Shared access to the slot's inner state (read-only peeks like `fh_get_reg`).
     ///
     /// # Safety
-    /// The caller must hold this slot, and no `&mut` from [`inner_mut`](Self::inner_mut)
-    /// may be live for the duration of the borrow.
+    /// The caller must hold this slot; no [`inner_mut`](Self::inner_mut) borrow may be live.
     #[inline]
     pub unsafe fn inner_ref(&self) -> &SlotInner {
         &*self.inner.get()
@@ -167,10 +162,8 @@ static MUTATIONS: AtomicU64 = AtomicU64::new(0);
 /// where the generation is a global **u16** bumped on every module add/remove — after
 /// 65535 mutations it wraps, and a never-cleared entry in a rarely-claimed slot could
 /// then resurrect a stale rule for recycled code. Sweeping all claimable slot caches
-/// every `CACHE_SWEEP_MUTATIONS` *mutations* (counted exactly via [`WriterUnw`]; a single
-/// publish can carry many, e.g. a module refresh) keeps every cache's contents well
-/// inside one generation cycle, with an 8x margin. Writer-thread only; allocation is
-/// fine here.
+/// every `CACHE_SWEEP_MUTATIONS` mutations (counted exactly via [`WriterUnw`] — one
+/// publish can carry many) keeps every cache well inside one generation cycle, 8x margin.
 const CACHE_SWEEP_MUTATIONS: u64 = 8192;
 
 fn sweep_slot_caches() {
@@ -215,8 +208,7 @@ fn slots() -> Option<&'static [Slot]> {
 }
 
 /// Claim a free slot with a lock-free CAS scan. Signal-safe. Returns the slot index and
-/// the claim nonce the owning cursor must present on every later access (see
-/// [`Slot::seq`]).
+/// the claim nonce the cursor must present on later access (see [`Slot::seq`]).
 pub fn claim_slot() -> Option<(usize, u64)> {
     let slots = slots()?;
     for (i, s) in slots.iter().enumerate() {
@@ -231,8 +223,8 @@ pub fn claim_slot() -> Option<(usize, u64)> {
     None
 }
 
-/// True iff `nonce` is the current claim nonce of slot `idx` (i.e. the presenting cursor
-/// is the slot's live owner, not a stale copy). Signal-safe.
+/// True iff `nonce` is slot `idx`'s current claim nonce (presenting cursor is the live
+/// owner, not a stale copy). Signal-safe.
 #[inline]
 pub fn nonce_matches(idx: usize, nonce: u64) -> bool {
     match slot(idx) {
@@ -246,10 +238,9 @@ pub fn slot(idx: usize) -> Option<&'static Slot> {
     slots()?.get(idx)
 }
 
-/// Release a slot claimed with `nonce`: retire the claim, clear the hazard, and mark the
+/// Release a slot claimed with `nonce`: retire the claim, clear the hazard, mark the
 /// slot free. Signal-safe. The release right is taken by CAS-ing `seq` from `nonce`, so
-/// exactly one releaser wins — a stale cursor copy (or a double-fini racing the slot's
-/// next owner) loses the CAS and becomes a no-op instead of freeing someone else's slot.
+/// exactly one releaser wins; a stale copy / racing double-fini no-ops.
 pub fn release_slot(idx: usize, nonce: u64) {
     if let Some(s) = slot(idx) {
         if s.seq
@@ -264,8 +255,7 @@ pub fn release_slot(idx: usize, nonce: u64) {
             return; // not the live owner of this claim
         }
         s.hazard.store(ptr::null_mut(), Ordering::SeqCst);
-        // Drop the snapshot reference held in inner (just clears the raw pointer; the
-        // snapshot itself is reclaimed by the writer, never here).
+        // Clears only the raw pointer; the snapshot is reclaimed by the writer, never here.
         // SAFETY: we won the release CAS, so we are the unique owner until in_use clears.
         unsafe {
             s.inner_mut().snapshot = ptr::null();
@@ -332,11 +322,9 @@ fn reclaim(st: &mut WriterState) {
     });
 }
 
-/// Mutation-counting facade over [`Unw`], handed to [`with_writer`] closures. Counting
-/// every add/remove exactly is what makes the cache-sweep bound real: framehop bumps its
-/// (u16, wrapping) global modules-generation once per *mutation*, and one publish can
-/// carry many (a refresh after loading many libraries), so counting publishes would
-/// under-count.
+/// Mutation-counting facade over [`Unw`] for [`with_writer`] closures. framehop's u16
+/// generation bumps once per *mutation* and one publish can carry many, so the sweep
+/// bound must count mutations, not publishes.
 pub struct WriterUnw<'a> {
     unw: &'a mut Unw,
     mutations: u64,

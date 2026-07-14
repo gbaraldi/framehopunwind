@@ -89,10 +89,9 @@ pub fn init() {
 }
 
 /// Re-scan loaded modules and publish a snapshot reflecting additions, removals, and
-/// changed images (same base, different fingerprint). The JIT modules are preserved.
-/// If enumeration fails outright (Windows `EnumProcessModules` can), the previous
-/// snapshot is kept untouched — an empty result must never be mistaken for "everything
-/// was unloaded". Off the signal path.
+/// changed images (same base, different fingerprint). JIT modules are preserved; a
+/// failed enumeration keeps the previous snapshot (an empty result must not read as
+/// "everything unloaded"). Off the signal path.
 #[cfg(not(target_os = "macos"))]
 pub fn refresh() {
     let mut reg = registry();

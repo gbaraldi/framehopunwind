@@ -33,12 +33,10 @@
  * fault. This crate does NOT install its own SIGSEGV handler (it would conflict with the
  * embedder's, e.g. Julia's).
  *
- * If the embedder instead survives a faulting read by longjmp/siglongjmp-ing out of
- * fh_step from its SIGSEGV handler (Julia's jl_set_safe_restore), be aware the jump
- * crosses this library's (Rust) frames. That is defined behavior only while those frames
- * hold no pending destructors; the read path is written allocation- and destructor-free
- * to keep that true, but exact bounds — which avoid the fault entirely — are the
- * *supported* configuration, and the longjmp path is best-effort.
+ * Surviving a faulting read by longjmp-ing out of fh_step (Julia's jl_set_safe_restore)
+ * crosses this library's Rust frames — defined behavior only while they hold no pending
+ * destructors. The read path is kept destructor-free, but exact bounds (which avoid the
+ * fault entirely) are the *supported* configuration; the longjmp path is best-effort.
  *
  * fh_thread_register also pre-faults this library's thread-local storage. Any thread
  * that will RUN the unwinder (including sampler/listener threads that only ever unwind
@@ -51,11 +49,9 @@
  * fh_cursor_init returns <0 (skip that sample) — it never blocks or allocates.
  *
  * A cursor is single-owner: do not copy the struct, share it across threads, or step it
- * concurrently. (Defense-in-depth: each cursor carries a per-claim nonce, so fini on a
- * stale copy — or a double fini racing the slot's next owner — degrades to a no-op
- * instead of corrupting another walk; do not rely on this.) fh_cursor_init on a cursor
- * that is still live does NOT release the old slot (it never reads the caller's possibly
- * uninitialized memory) — fini first, or the slot leaks.
+ * concurrently. (A per-claim nonce makes fini on a stale copy or a racing double-fini a
+ * no-op — defense-in-depth, do not rely on it.) fh_cursor_init on a still-live cursor
+ * does NOT release the old slot — fini first, or the slot leaks.
  *
  * Therefore the caller MUST guarantee fh_cursor_fini runs for every successful
  * fh_cursor_init, INCLUDING on any fault-recovery path. If you rely on a SIGSEGV handler

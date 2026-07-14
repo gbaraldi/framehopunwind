@@ -150,8 +150,7 @@ mod api {
         if ctx.is_null() {
             return;
         }
-        // SAFETY: ctx is valid caller-allocated storage; fully initialize it through a
-        // raw write BEFORE forming a Rust reference (the caller's struct may be uninit).
+        // SAFETY: valid caller storage; raw-write before forming a reference (may be uninit).
         unsafe { ctx.write(FhContext::zeroed()) };
         let ctx = unsafe { &mut *ctx };
         crate::capture::context_from_os(ctx, os_ctx);

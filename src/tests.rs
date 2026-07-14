@@ -295,10 +295,8 @@ fn cursor_init_bounds_clamps_reads() {
     }
 }
 
-/// A byte-for-byte copy of a cursor that is fini'd *after* the original released its slot
-/// (and the slot was possibly re-claimed by a new walk) must be a no-op: the per-claim
-/// nonce is retired at release, so the stale copy loses the release CAS instead of
-/// freeing (or corrupting) the slot's next owner.
+/// Fini on a byte copy of an already-fini'd cursor must be a no-op (the stale nonce
+/// loses the release CAS), even if the slot was re-claimed by a new walk.
 #[test]
 fn stale_cursor_copy_cannot_release_reclaimed_slot() {
     ensure_init();
@@ -306,8 +304,7 @@ fn stale_cursor_copy_cannot_release_reclaimed_slot() {
     let mut ctx = FhContext::zeroed();
     capture::fh_capture_context(&mut ctx);
 
-    // Claim a slot with cursor A, then duplicate the raw cursor bytes (what a careless C
-    // caller does with struct assignment).
+    // Claim a slot with cursor A, then duplicate the raw cursor bytes (C struct copy).
     let mut a: FhCursor = unsafe { core::mem::zeroed() };
     assert_eq!(cursor::cursor_init(&mut a, &ctx), 0);
     let mut stale: FhCursor = unsafe { core::ptr::read(&a) };
@@ -317,8 +314,7 @@ fn stale_cursor_copy_cannot_release_reclaimed_slot() {
     let mut b: FhCursor = unsafe { core::mem::zeroed() };
     assert_eq!(cursor::cursor_init(&mut b, &ctx), 0);
 
-    // The stale copy still carries A's magic + slot index, but its nonce was retired at
-    // A's fini: this must not release whatever the slot now holds.
+    // Stale copy: valid magic + slot, retired nonce — must not release the slot.
     cursor::cursor_fini(&mut stale);
 
     // B must still step normally (its slot was not freed under it).
@@ -338,8 +334,7 @@ fn stale_cursor_copy_cannot_release_reclaimed_slot() {
 // and libunwind share) with sentinel values, so silent layout drift fails the tests.
 // ---------------------------------------------------------------------------
 
-// Only Linux and macOS have layout tests below (FreeBSD/Windows would need their own
-// ucontext/CONTEXT fixtures); gate the sentinels to the tests that consume them.
+// Sentinels are gated to the OS/arch combinations whose layout tests consume them.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const SENT_IP: u64 = 0x1111_2222_3333_4444;
 #[cfg(any(target_os = "linux", target_os = "macos"))]

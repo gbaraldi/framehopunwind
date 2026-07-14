@@ -33,17 +33,15 @@ use crate::state::Bytes;
 // We read its fields by offset (the in-memory image is only byte-aligned).
 const SECTION_HEADER_SIZE: usize = 40;
 
-/// Enumerate loaded PE modules. Returns `None` if `EnumProcessModules` itself fails —
-/// the caller must then keep its previous module set rather than treating the empty
-/// result as "everything was unloaded".
+/// Enumerate loaded PE modules. Returns `None` if enumeration itself fails, so the
+/// caller keeps its previous module set instead of treating it as "all unloaded".
 pub fn enumerate(known: &HashMap<u64, u64>) -> Option<EnumResult> {
     let mut current = HashMap::new();
     let mut new_modules = Vec::new();
 
     let process = unsafe { GetCurrentProcess() };
 
-    // Enumerate module handles, growing the buffer until it fits: the module list can
-    // grow between the size query and the fill, and a truncated list would make refresh()
+    // Grow the buffer until the list fits: a truncated list would make refresh()
     // "unload" every module past the truncation point.
     let mut handles: Vec<HMODULE> = Vec::new();
     for attempt in 0.. {
@@ -66,11 +64,9 @@ pub fn enumerate(known: &HashMap<u64, u64>) -> Option<EnumResult> {
     }
 
     for &hmod in &handles {
-        // Pin the module (bumps its loader refcount) before touching its image memory:
-        // EnumProcessModules hands back unpinned handles, and a concurrent FreeLibrary
-        // could otherwise unmap the image between the checks below and our section
-        // copies. A module that vanished before we could pin it is simply skipped —
-        // refresh() then treats it as unloaded, which it is.
+        // Pin the module (loader refcount) before touching its image: the enumerated
+        // handles are unpinned, so a concurrent FreeLibrary could unmap the image under
+        // our section copies. Vanished-before-pin modules are skipped (== unloaded).
         let mut pinned: HMODULE = core::ptr::null_mut();
         let ok = unsafe {
             GetModuleHandleExW(
@@ -96,9 +92,8 @@ pub fn enumerate(known: &HashMap<u64, u64>) -> Option<EnumResult> {
             let base = info.lpBaseOfDll as u64;
             let size = info.SizeOfImage as u64;
             let key = base;
-            // Identity: image size + PE header link timestamp. Size alone cannot tell two
-            // different DLLs apart when a base address is reused; the timestamp (set by
-            // the linker, or a reproducible-build hash) almost always can.
+            // Size alone can't tell two DLLs apart across base-address reuse; the PE
+            // link timestamp almost always can.
             let timestamp = unsafe { pe_timestamp(base) } as u64;
             let fp = super::fingerprint_of(&[size, timestamp], b"");
             current.insert(key, fp);

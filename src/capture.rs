@@ -15,10 +15,8 @@ use crate::arch::FhContext;
 cfg_if::cfg_if! {
     if #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))] {
         /// Capture the current (caller's) context into `*ctx`. SysV: arg in `rdi`.
-        ///
-        /// Writes ALL five context words (zeroing the unused ones): C callers pass a
-        /// stack-allocated `fh_context`, and Rust later forms references to it, so no
-        /// word may be left uninitialized.
+        /// Writes all five words (zeroing unused ones) — Rust later forms references
+        /// over the caller's struct, so no word may stay uninitialized.
         #[no_mangle]
         #[unsafe(naked)]
         pub extern "C" fn fh_capture_context(ctx: *mut FhContext) {

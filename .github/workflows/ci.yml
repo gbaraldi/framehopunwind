@@ -37,10 +37,9 @@ jobs:
           toolchain: "1.88"
       - run: cargo check --all-targets
 
-  # The hazard-pointer snapshot protocol under ThreadSanitizer (see the concurrent
-  # register/unwind stress test). Nightly-only (-Zsanitizer / -Zbuild-std). Frame
-  # pointers are re-forced because the RUSTFLAGS env override replaces
-  # .cargo/config.toml's rustflags.
+  # Hazard-pointer stress test under ThreadSanitizer (nightly-only). --lib skips the
+  # empty doctest harness (unsanitized rustdoc crashes under -Zbuild-std sanitizers);
+  # frame pointers re-forced because RUSTFLAGS replaces .cargo/config.toml's rustflags.
   tsan:
     runs-on: ubuntu-latest
     steps:
@@ -48,8 +47,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
-      # --lib: skip the (empty) doctest harness, whose unsanitized rustdoc runner crashes
-      # under -Zbuild-std sanitizers.
       - run: cargo test -Zbuild-std --target x86_64-unknown-linux-gnu --lib -- concurrent
         env:
           RUSTFLAGS: "-Zsanitizer=thread -Cforce-frame-pointers=yes"

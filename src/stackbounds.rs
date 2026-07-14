@@ -81,11 +81,8 @@ unsafe fn query_bounds() -> (u64, u64) {
 
 #[cfg(not(unix))]
 unsafe fn query_bounds() -> (u64, u64) {
-    // Windows: stack bounds for the *current* thread could be read from the TIB, but
-    // Julia's Windows sampler unwinds a *different* (suspended) thread, so per-thread
-    // bounds captured here would never match the walk's sp and the reader would take the
-    // sp-derived fallback window anyway. Callers should pass the target thread's stack
-    // range to fh_cursor_init_bounds; absent that, only the fallback window bounds the
-    // reads. Return unknown here (registration still pre-faults this TLS slot).
+    // Windows: the sampler unwinds a *different* (suspended) thread, so current-thread
+    // TIB bounds would never match the walk's sp; callers should use
+    // fh_cursor_init_bounds instead. Return unknown (registration still pre-faults TLS).
     (0, 0)
 }
