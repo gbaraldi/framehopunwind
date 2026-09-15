@@ -19,9 +19,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [dependencies]
 # framehop is the actual unwinding engine. We carry both arch backends (only the
 # native one is used at runtime) and all unwind-info formats so a single build
-# can serve ELF/Mach-O/PE depending on the host OS. Pinned via Cargo.lock for
-# reproducible builds (the JIT pcrel resolution is verified against gimli 0.33).
-framehop = { version = "0.16", default-features = false, features = ["std", "macho", "pe"] }
+# can serve ELF/Mach-O/PE depending on the host OS. The vendored 0.16.0 adds a
+# non-reusing 64-bit module generation; see vendor/README.md. Other dependencies are
+# pinned via Cargo.lock (the JIT pcrel resolution is verified against gimli 0.33).
+framehop = { path = "vendor/framehop", version = "0.16", default-features = false, features = ["std", "macho", "pe"] }
 # Same gimli version framehop pins; used to derive a JIT module's code range from its
 # .eh_frame when the caller doesn't supply one (fh_register_jit_auto).
 gimli = { version = "0.33", default-features = false, features = ["read", "std"] }

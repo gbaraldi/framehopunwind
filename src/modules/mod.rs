@@ -20,7 +20,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
 
-use framehop::Module;
+use framehop::{Module, Unwinder};
 
 use crate::state::{self, Bytes};
 

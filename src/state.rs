@@ -26,7 +26,7 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use framehop::{
-    CacheNative, FrameAddress, Module, MustNotAllocateDuringUnwind, UnwindRegsNative, Unwinder,
+    CacheNative, FrameAddress, MustNotAllocateDuringUnwind, UnwindRegsNative, Unwinder,
     UnwinderNative,
 };
 
@@ -153,37 +153,6 @@ static WRITER: Mutex<WriterState> = Mutex::new(WriterState {
 });
 
 const DEFAULT_SLOTS: usize = 256;
-
-/// Count of module *mutations* (add/remove) applied through [`with_writer`], driving the
-/// periodic rule-cache sweep below.
-static MUTATIONS: AtomicU64 = AtomicU64::new(0);
-
-/// framehop keys its per-cache unwind-rule entries by `(address, modules_generation)`
-/// where the generation is a global **u16** bumped on every module add/remove — after
-/// 65535 mutations it wraps, and a never-cleared entry in a rarely-claimed slot could
-/// then resurrect a stale rule for recycled code. Sweeping all claimable slot caches
-/// every `CACHE_SWEEP_MUTATIONS` mutations (counted exactly via [`WriterUnw`] — one
-/// publish can carry many) keeps every cache well inside one generation cycle, 8x margin.
-const CACHE_SWEEP_MUTATIONS: u64 = 8192;
-
-fn sweep_slot_caches() {
-    if let Some(slots) = slots() {
-        for s in slots {
-            if s.in_use
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
-                // SAFETY: we own the slot via the CAS; replacing the cache cannot race a
-                // reader. A slot held by an in-flight walk is skipped — its cache entries
-                // are at most one walk old and the next sweep will catch it.
-                unsafe {
-                    s.inner_mut().cache = CacheNative::new_in();
-                }
-                s.in_use.store(false, Ordering::Release);
-            }
-        }
-    }
-}
 
 /// Initialize the slot pool. Idempotent; `num_slots == 0` selects a default.
 /// Must be called off the signal path (it allocates the caches).
@@ -322,30 +291,11 @@ fn reclaim(st: &mut WriterState) {
     });
 }
 
-/// Mutation-counting facade over [`Unw`] for [`with_writer`] closures. framehop's u16
-/// generation bumps once per *mutation* and one publish can carry many, so the sweep
-/// bound must count mutations, not publishes.
-pub struct WriterUnw<'a> {
-    unw: &'a mut Unw,
-    mutations: u64,
-}
-
-impl WriterUnw<'_> {
-    pub fn add_module(&mut self, module: Module<Bytes>) {
-        self.mutations += 1;
-        self.unw.add_module(module);
-    }
-    pub fn remove_module(&mut self, module_address_range_start: u64) {
-        self.mutations += 1;
-        self.unw.remove_module(module_address_range_start);
-    }
-}
-
 /// Run a mutation against a fresh clone of the current module set and publish it.
 ///
-/// `f` receives a [`WriterUnw`] (cloned from the current snapshot, or empty) and adds /
+/// `f` receives an [`Unw`] (cloned from the current snapshot, or empty) and adds /
 /// removes modules. Off the signal path; allocates.
-pub fn with_writer<R>(f: impl FnOnce(&mut WriterUnw) -> R) -> R {
+pub fn with_writer<R>(f: impl FnOnce(&mut Unw) -> R) -> R {
     let mut guard = WRITER.lock().unwrap_or_else(|e| e.into_inner());
 
     let cur = CURRENT.load(Ordering::Acquire);
@@ -357,12 +307,7 @@ pub fn with_writer<R>(f: impl FnOnce(&mut WriterUnw) -> R) -> R {
         unsafe { (*cur).unw.clone() }
     };
 
-    let mut writer = WriterUnw {
-        unw: &mut new_unw,
-        mutations: 0,
-    };
-    let ret = f(&mut writer);
-    let mutations = writer.mutations;
+    let ret = f(&mut new_unw);
 
     let max_code_addr = new_unw.max_known_code_address();
     let boxed = Box::into_raw(Box::new(Snapshot {
@@ -377,9 +322,5 @@ pub fn with_writer<R>(f: impl FnOnce(&mut WriterUnw) -> R) -> R {
         guard.retired.push(old);
     }
     reclaim(&mut guard);
-    let before = MUTATIONS.fetch_add(mutations, Ordering::Relaxed);
-    if before / CACHE_SWEEP_MUTATIONS != (before + mutations) / CACHE_SWEEP_MUTATIONS {
-        sweep_slot_caches();
-    }
     ret
 }

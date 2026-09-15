@@ -23,6 +23,8 @@ jobs:
           components: clippy
       - run: cargo build --release
       - run: cargo test
+      - name: Patched framehop unit tests (generation wrap and exhaustion)
+        run: cargo test --locked --manifest-path vendor/framehop/Cargo.toml --lib
       - run: cargo clippy --all-targets -- -D warnings
       - name: C smoke test (public header + cdylib through the real C ABI)
         run: sh tests/run_c_smoke.sh

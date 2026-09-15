@@ -56,7 +56,9 @@ framehop is x86_64 + aarch64 only, and its PE backend is x86_64-only.
 ## Design notes
 
 * **Hazard-pointer snapshot** (`src/state.rs`): writers publish a fresh immutable `Snapshot` (cloned framehop `Unwinder` + the mutation) via an atomic pointer; a reader publishes the pointer it is about to use into a global hazard slot and re-checks it is still current, guaranteeing the writer won't free a snapshot under a live reader. Reclamation happens on the writer thread.
+* **Cache lifetime**: the vendored framehop patch (`vendor/README.md`) uses a non-reusing 64-bit module generation in its rule-cache keys. Cursors may retain their caches across arbitrarily many snapshots without periodic sweeps or reader-side resets.
 * **Owned bytes**: all unwind sections (`.eh_frame`, `__unwind_info`, `.pdata`, …) are *copied* into owned memory at registration, so a later `dlclose`/`munmap` or a Julia free of a JIT buffer cannot dangle a snapshot mid-read.
+  Mach-O `__TEXT` bytes are retained regardless of image size: compact unwind needs them for prologues, epilogues, and indirect stack sizes. Large images therefore increase memory use by the size of their copied text segments; snapshots share these immutable copies.
 * **JIT `.eh_frame` mapping** (the correctness crux, verified against framehop 0.16 + gimli 0.33): `base_svma == base_avma == text_lo`, and `eh_frame_svma.start` is set to the **runtime** address of the eh_frame buffer so gimli resolves `DW_EH_PE_pcrel` `pc_begin` correctly.
 
 ## Build

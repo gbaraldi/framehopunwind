@@ -25,13 +25,6 @@ use crate::state::Bytes;
 
 const LC_SEGMENT_64: u32 = 0x19;
 
-/// Cap on copying an image's `__TEXT` segment. framehop only consults the text bytes for
-/// instruction analysis at prologue/epilogue boundaries (compact unwind); retaining the
-/// whole `__TEXT` of every image would cost ~100 MB of permanent RSS in a Julia process
-/// (libLLVM alone is ~60 MB). Larger images simply skip the copy and take the rule-only
-/// behavior at frame edges.
-const TEXT_COPY_MAX: u64 = 4 << 20;
-
 // `section_64` is not exposed by the `libc` crate on Apple targets, so we define it here
 // (stable Mach-O layout).
 #[repr(C)]
@@ -167,9 +160,10 @@ unsafe fn build_image(
         if lc.cmd == LC_SEGMENT_64 {
             let seg = &*(p as *const libc::segment_command_64);
             let is_text = seg_name_eq(&seg.segname, b"__TEXT");
-            if is_text && seg.vmsize <= TEXT_COPY_MAX {
-                // Copy __TEXT for instruction analysis — but only for modest images (see
-                // TEXT_COPY_MAX); large ones skip the copy rather than bloat RSS.
+            if is_text {
+                // Compact unwind rules need instruction bytes even for large images:
+                // prologues/epilogues and indirect stack sizes cannot be recovered
+                // reliably from the compact opcode alone.
                 let bytes = copy_mem(
                     (seg.vmaddr.wrapping_add(slide)) as *const u8,
                     seg.vmsize as usize,
@@ -280,4 +274,98 @@ fn name_eq(field: &[libc::c_char; 16], name: &[u8]) -> bool {
     }
     // The remainder must be NUL (unless the name fills all 16 bytes).
     name.len() == 16 || field[name.len()] == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use framehop::x86_64::{CacheX86_64, UnwindRegsX86_64, UnwinderX86_64};
+    use framehop::{FrameAddress, MustNotAllocateDuringUnwind, Unwinder};
+
+    #[test]
+    fn large_image_keeps_text_for_prologue_and_epilogue_unwinding() {
+        // A mapped Mach-O image larger than the old 4 MiB cutoff. Only its data
+        // is interpreted, so this x86-64 fixture also runs on an arm64 Mac.
+        let mut image = vec![0u64; (5 * 1024 * 1024) / 8];
+        let base = image.as_ptr() as u64;
+        let len = image.len() * 8;
+        let bytes =
+            unsafe { core::slice::from_raw_parts_mut(image.as_mut_ptr().cast::<u8>(), len) };
+        fn put32(b: &mut [u8], at: usize, value: u32) {
+            b[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        fn put64(b: &mut [u8], at: usize, value: u64) {
+            b[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        put32(bytes, 0, 0xfeedfacf);
+        put32(bytes, 4, 0x01000007); // CPU_TYPE_X86_64
+        put32(bytes, 16, 1); // ncmds
+        put32(bytes, 20, 72 + 2 * 80);
+        let segment = 32;
+        put32(bytes, segment, LC_SEGMENT_64);
+        put32(bytes, segment + 4, 72 + 2 * 80);
+        bytes[segment + 8..segment + 14].copy_from_slice(b"__TEXT");
+        put64(bytes, segment + 24, base);
+        put64(bytes, segment + 32, len as u64);
+        put64(bytes, segment + 48, len as u64);
+        put32(bytes, segment + 64, 2);
+        for (i, name, offset, size) in [
+            (0, b"__text".as_slice(), 0x1000, 16),
+            (1, b"__unwind_info".as_slice(), 0x2000, 68),
+        ] {
+            let section = segment + 72 + i * 80;
+            bytes[section..section + name.len()].copy_from_slice(name);
+            bytes[section + 16..section + 22].copy_from_slice(b"__TEXT");
+            put64(bytes, section + 32, base + offset);
+            put64(bytes, section + 40, size);
+        }
+        // push rbp; mov rbp,rsp; nop; pop rbp; ret
+        bytes[0x1000..0x1007].copy_from_slice(&[0x55, 0x48, 0x89, 0xe5, 0x90, 0x5d, 0xc3]);
+        // Compact unwind header, index with sentinel, regular second-level page.
+        let words = [
+            1,
+            0,
+            0,
+            0,
+            0,
+            28,
+            2,
+            0x1000,
+            52,
+            0,
+            0x1010,
+            0,
+            0,
+            2,
+            (1 << 16) | 8,
+            0x1000,
+            0x01000000,
+        ];
+        for (i, word) in words.into_iter().enumerate() {
+            put32(bytes, 0x2000 + i * 4, word);
+        }
+        let (_, _, module) =
+            unsafe { build_image(image.as_ptr().cast::<libc::mach_header_64>(), 0) }.unwrap();
+        let mut unw = UnwinderX86_64::new();
+        unw.add_module(module.unwrap());
+        // The snapshot must retain its own text copy after the image goes away.
+        drop(image);
+        let mut stack = [0u64; 0x180 / 8];
+        stack[0x130 / 8] = 0x160;
+        stack[0x138 / 8] = 0x12345;
+        for (offset, sp, bp) in [(1, 0x130, 0x160), (4, 0x130, 0x130), (6, 0x138, 0x160)] {
+            let pc = base + 0x1000 + offset;
+            let mut regs = UnwindRegsX86_64::new(pc, sp, bp);
+            let mut cache = CacheX86_64::<MustNotAllocateDuringUnwind>::new_in();
+            let result = unw.unwind_frame(
+                FrameAddress::from_instruction_pointer(pc),
+                &mut regs,
+                &mut cache,
+                &mut |addr| stack.get((addr / 8) as usize).copied().ok_or(()),
+            );
+            assert_eq!(result, Ok(Some(0x12345)), "instruction offset {offset}");
+            assert_eq!(regs.sp(), 0x140);
+            assert_eq!(regs.bp(), 0x160);
+        }
+    }
 }
