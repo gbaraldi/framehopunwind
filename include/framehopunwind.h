@@ -166,6 +166,14 @@ int fh_cursor_init(fh_cursor *cur, const fh_context *ctx);
 int fh_cursor_init_bounds(fh_cursor *cur, const fh_context *ctx,
                           uint64_t stack_lo, uint64_t stack_hi);
 
+/* Like fh_cursor_init_bounds, plus a second stack-read window [stack_lo2, stack_hi2)
+ * (ignored if empty). For a context on a signal handler's alternate stack, pass that
+ * stack first and the stack the signal interrupted second, so the walk continues past the
+ * signal frame into the interrupted code. */
+int fh_cursor_init_bounds2(fh_cursor *cur, const fh_context *ctx,
+                           uint64_t stack_lo, uint64_t stack_hi,
+                           uint64_t stack_lo2, uint64_t stack_hi2);
+
 /* Output the CURRENT frame's ip/sp into *ip and *sp, then advance one frame.
  * Returns:  >0  a frame was produced and more may follow;
  *            0  reached the end of the stack (clean);

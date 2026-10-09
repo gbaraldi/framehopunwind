@@ -28,6 +28,7 @@ impl DwarfUnwinding for ArchX86_64 {
         encoding: Encoding,
         regs: &mut Self::UnwindRegs,
         is_first_frame: bool,
+        is_signal_frame: bool,
         read_stack: &mut F,
     ) -> Result<UnwindResult<Self::UnwindRule>, DwarfUnwinderError>
     where
@@ -40,15 +41,18 @@ impl DwarfUnwinding for ArchX86_64 {
         let bp_rule = unwind_info.register(X86_64::RBP);
         let ra_rule = unwind_info.register(X86_64::RA);
 
-        match translate_into_unwind_rule(cfa_rule, bp_rule.as_ref(), ra_rule.as_ref()) {
-            Ok(unwind_rule) => return Ok(UnwindResult::ExecRule(unwind_rule)),
-            Err(_err) => {
-                // Could not translate into a cacheable unwind rule. Fall back to the generic path.
-                // eprintln!("Unwind rule translation failed: {:?}", err);
+        // A signal frame always takes the generic path, which reports it as interrupted.
+        if !is_signal_frame {
+            match translate_into_unwind_rule(cfa_rule, bp_rule.as_ref(), ra_rule.as_ref()) {
+                Ok(unwind_rule) => return Ok(UnwindResult::ExecRule(unwind_rule)),
+                Err(_err) => {
+                    // Could not translate into a cacheable unwind rule. Fall back to the generic path.
+                    // eprintln!("Unwind rule translation failed: {:?}", err);
+                }
             }
         }
 
-        let cfa = eval_cfa_rule::<R, _, ES>(section, cfa_rule, encoding, regs)
+        let cfa = eval_cfa_rule::<R, _, ES, F>(section, cfa_rule, encoding, regs, read_stack)
             .ok_or(DwarfUnwinderError::CouldNotRecoverCfa)?;
 
         let ip = regs.ip();
@@ -72,7 +76,9 @@ impl DwarfUnwinding for ArchX86_64 {
         if cfa == sp && return_address == ip {
             return Err(DwarfUnwinderError::DidNotAdvance);
         }
-        if !is_first_frame && cfa < regs.sp() {
+        // The code a signal interrupted may run on another stack than the signal handler, so
+        // its stack pointer can be anywhere relative to the handler's.
+        if !is_first_frame && !is_signal_frame && cfa < regs.sp() {
             return Err(DwarfUnwinderError::StackPointerMovedBackwards);
         }
 
@@ -80,7 +86,11 @@ impl DwarfUnwinding for ArchX86_64 {
         regs.set_bp(new_bp);
         regs.set_sp(cfa);
 
-        Ok(UnwindResult::Uncacheable(return_address))
+        if is_signal_frame {
+            Ok(UnwindResult::Interrupted(return_address))
+        } else {
+            Ok(UnwindResult::Uncacheable(return_address))
+        }
     }
 
     fn rule_if_uncovered_by_fde() -> Self::UnwindRule {

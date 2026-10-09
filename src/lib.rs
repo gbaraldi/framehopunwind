@@ -199,6 +199,25 @@ mod api {
         crate::cursor::cursor_init_bounds(cur, ctx, stack_lo, stack_hi)
     }
 
+    /// Like `fh_cursor_init_bounds`, plus a second stack-read window
+    /// `[stack_lo2, stack_hi2)` (ignored if empty). Pass the signal stack as the first
+    /// window and the interrupted stack as the second to walk from a signal handler running
+    /// on an alternate stack into the code it interrupted. Async-signal-safe.
+    #[no_mangle]
+    pub extern "C" fn fh_cursor_init_bounds2(
+        cur: *mut FhCursor,
+        ctx: *const FhContext,
+        stack_lo: u64,
+        stack_hi: u64,
+        stack_lo2: u64,
+        stack_hi2: u64,
+    ) -> c_int {
+        if cur.is_null() || ctx.is_null() {
+            return -100;
+        }
+        crate::cursor::cursor_init_bounds2(cur, ctx, stack_lo, stack_hi, stack_lo2, stack_hi2)
+    }
+
     /// Output the current frame's ip/sp into `*ip`/`*sp`, then advance one frame.
     /// Returns `>0` if more frames may follow, `0` at a clean end, `<0` on error.
     /// Async-signal-safe. (Outputs are written through raw pointers, so `ip == sp`
@@ -305,6 +324,17 @@ mod api_stub {
         _ctx: *const c_void,
         _stack_lo: u64,
         _stack_hi: u64,
+    ) -> c_int {
+        -1
+    }
+    #[no_mangle]
+    pub extern "C" fn fh_cursor_init_bounds2(
+        _cur: *mut c_void,
+        _ctx: *const c_void,
+        _stack_lo: u64,
+        _stack_hi: u64,
+        _stack_lo2: u64,
+        _stack_hi2: u64,
     ) -> c_int {
         -1
     }

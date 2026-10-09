@@ -629,3 +629,137 @@ mod jit_path {
         crate::modules::deregister_jit_eh_frame(eh_ptr);
     }
 }
+
+/// A walk from a signal handler running on an alternate stack must continue past the signal
+/// frame into the code the signal interrupted, given both stacks as windows.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod signal_frame {
+    use super::*;
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    const MAX: usize = 64;
+    static HANDLER_IPS: [AtomicU64; MAX] = [const { AtomicU64::new(0) }; MAX];
+    static HANDLER_N: AtomicUsize = AtomicUsize::new(0);
+    static EXPECTED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    static ALT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    static STACK: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    static INTERRUPTED_IP: AtomicU64 = AtomicU64::new(0);
+
+    extern "C" fn handler(_sig: libc::c_int, _info: *mut libc::siginfo_t, uc: *mut libc::c_void) {
+        // SAFETY: the kernel passes a valid ucontext_t to an SA_SIGINFO handler.
+        let gregs = unsafe { (*(uc as *const libc::ucontext_t)).uc_mcontext.gregs };
+        INTERRUPTED_IP.store(gregs[libc::REG_RIP as usize] as u64, Ordering::Relaxed);
+        let mut ctx = FhContext::zeroed();
+        capture::fh_capture_context(&mut ctx);
+        let mut cur: FhCursor = unsafe { core::mem::zeroed() };
+        let rc = cursor::cursor_init_bounds2(
+            &mut cur,
+            &ctx,
+            ALT[0].load(Ordering::Relaxed),
+            ALT[1].load(Ordering::Relaxed),
+            STACK[0].load(Ordering::Relaxed),
+            STACK[1].load(Ordering::Relaxed),
+        );
+        if rc != 0 {
+            return;
+        }
+        let (mut ip, mut sp) = (0u64, 0u64);
+        let mut n = 0;
+        while n < MAX {
+            let more = cursor::step(&mut cur, &mut ip, &mut sp);
+            if ip != 0 {
+                HANDLER_IPS[n].store(ip, Ordering::Relaxed);
+                n += 1;
+            }
+            if more <= 0 {
+                break;
+            }
+        }
+        cursor::cursor_fini(&mut cur);
+        HANDLER_N.store(n, Ordering::Release);
+    }
+
+    #[inline(never)]
+    fn raise_c() {
+        let rbp: u64;
+        unsafe { core::arch::asm!("mov {}, rbp", out(reg) rbp) };
+        for (slot, ret) in EXPECTED.iter().zip(fp_chain(rbp, 4)) {
+            slot.store(ret, Ordering::Relaxed);
+        }
+        unsafe { libc::raise(libc::SIGUSR1) };
+        black_box(());
+    }
+    #[inline(never)]
+    fn raise_b() {
+        raise_c();
+        black_box(());
+    }
+    #[inline(never)]
+    fn raise_a() {
+        raise_b();
+        black_box(());
+    }
+
+    #[test]
+    fn walk_continues_past_signal_frame_on_alternate_stack() {
+        ensure_init();
+        let (lo, hi) = crate::stackbounds::current();
+        assert!(lo < hi, "thread stack bounds unknown");
+        STACK[0].store(lo, Ordering::Relaxed);
+        STACK[1].store(hi, Ordering::Relaxed);
+
+        let mut alt = vec![0u8; 256 * 1024];
+        let alt_lo = alt.as_mut_ptr() as u64;
+        ALT[0].store(alt_lo, Ordering::Relaxed);
+        ALT[1].store(alt_lo + alt.len() as u64, Ordering::Relaxed);
+        unsafe {
+            let ss = libc::stack_t {
+                ss_sp: alt.as_mut_ptr().cast(),
+                ss_flags: 0,
+                ss_size: alt.len(),
+            };
+            let mut old_ss: libc::stack_t = core::mem::zeroed();
+            assert_eq!(libc::sigaltstack(&ss, &mut old_ss), 0);
+            let mut sa: libc::sigaction = core::mem::zeroed();
+            sa.sa_sigaction = handler as usize;
+            sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+            libc::sigemptyset(&mut sa.sa_mask);
+            let mut old_sa: libc::sigaction = core::mem::zeroed();
+            assert_eq!(libc::sigaction(libc::SIGUSR1, &sa, &mut old_sa), 0);
+
+            raise_a();
+
+            libc::sigaction(libc::SIGUSR1, &old_sa, core::ptr::null_mut());
+            libc::sigaltstack(&old_ss, core::ptr::null_mut());
+        }
+
+        let n = HANDLER_N.load(Ordering::Acquire);
+        let walk: Vec<u64> = HANDLER_IPS[..n]
+            .iter()
+            .map(|a| a.load(Ordering::Relaxed))
+            .collect();
+        let expected: Vec<u64> = EXPECTED
+            .iter()
+            .map(|a| a.load(Ordering::Relaxed))
+            .take(3)
+            .collect();
+        assert!(
+            expected.iter().all(|&e| e != 0),
+            "fp oracle empty: {expected:#x?}"
+        );
+        // Stepping through the signal frame resumes at the exact interrupted instruction;
+        // following frame pointers instead would skip it.
+        let interrupted = INTERRUPTED_IP.load(Ordering::Relaxed);
+        assert!(
+            walk.contains(&interrupted),
+            "walk did not resume at the interrupted instruction {interrupted:#x}\n walk={walk:#x?}"
+        );
+        let found = walk
+            .windows(expected.len())
+            .any(|w| w == expected.as_slice());
+        assert!(
+            found,
+            "walk from the handler did not reach the interrupted code\n walk={walk:#x?}\n expected={expected:#x?}"
+        );
+    }
+}

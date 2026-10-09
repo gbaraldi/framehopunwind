@@ -72,12 +72,14 @@ pub enum ConversionError {
 }
 
 pub trait DwarfUnwinding: Arch {
+    #[allow(clippy::too_many_arguments)]
     fn unwind_frame<F, R, UCS, ES>(
         section: &impl UnwindSection<R>,
         unwind_info: &UnwindTableRow<R::Offset, UCS>,
         encoding: Encoding,
         regs: &mut Self::UnwindRegs,
         is_first_frame: bool,
+        is_signal_frame: bool,
         read_stack: &mut F,
     ) -> Result<UnwindResult<Self::UnwindRule>, DwarfUnwinderError>
     where
@@ -172,13 +174,14 @@ where
                 if let Err(DwarfUnwinderError::UnwindInfoForAddressFailed(_)) = unwind_info {
                     return Ok(UnwindResult::ExecRule(A::rule_if_uncovered_by_fde()));
                 }
-                let (unwind_info, encoding) = unwind_info?;
+                let (unwind_info, encoding, is_signal_frame) = unwind_info?;
                 A::unwind_frame::<F, R, UCS, ES>(
                     &eh_frame,
                     unwind_info,
                     encoding,
                     regs,
                     is_first_frame,
+                    is_signal_frame,
                     read_stack,
                 )
             }
@@ -189,13 +192,14 @@ where
                 if let Err(DwarfUnwinderError::UnwindInfoForAddressFailed(_)) = unwind_info {
                     return Ok(UnwindResult::ExecRule(A::rule_if_uncovered_by_fde()));
                 }
-                let (unwind_info, encoding) = unwind_info?;
+                let (unwind_info, encoding, is_signal_frame) = unwind_info?;
                 A::unwind_frame::<F, R, UCS, ES>(
                     &debug_frame,
                     unwind_info,
                     encoding,
                     regs,
                     is_first_frame,
+                    is_signal_frame,
                     read_stack,
                 )
             }
@@ -207,7 +211,7 @@ where
         unwind_section: &US,
         lookup_svma: u64,
         fde_offset: u32,
-    ) -> Result<(&UnwindTableRow<R::Offset, UCS>, Encoding), DwarfUnwinderError> {
+    ) -> Result<(&UnwindTableRow<R::Offset, UCS>, Encoding, bool), DwarfUnwinderError> {
         let fde = unwind_section.fde_from_offset(
             &self.bases,
             US::Offset::from(R::Offset::from_u32(fde_offset)),
@@ -215,6 +219,7 @@ where
         );
         let fde = fde.map_err(DwarfUnwinderError::FdeFromOffsetFailed)?;
         let encoding = fde.cie().encoding();
+        let is_signal_frame = fde.is_signal_trampoline();
         let unwind_info: &UnwindTableRow<_, _> = fde
             .unwind_info_for_address(
                 unwind_section,
@@ -223,7 +228,7 @@ where
                 lookup_svma,
             )
             .map_err(DwarfUnwinderError::UnwindInfoForAddressFailed)?;
-        Ok((unwind_info, encoding))
+        Ok((unwind_info, encoding, is_signal_frame))
     }
 }
 
@@ -386,12 +391,19 @@ pub trait DwarfUnwindRegs {
     fn get(&self, register: Register) -> Option<u64>;
 }
 
-pub fn eval_cfa_rule<R: Reader, UR: DwarfUnwindRegs, S: EvaluationStorage<R>>(
+pub fn eval_cfa_rule<R, UR, S, F>(
     section: &impl UnwindSection<R>,
     rule: &CfaRule<R::Offset>,
     encoding: Encoding,
     regs: &UR,
-) -> Option<u64> {
+    read_stack: &mut F,
+) -> Option<u64>
+where
+    R: Reader,
+    UR: DwarfUnwindRegs,
+    S: EvaluationStorage<R>,
+    F: FnMut(u64) -> Result<u64, ()>,
+{
     match rule {
         CfaRule::RegisterAndOffset { register, offset } => {
             let val = regs.get(*register)?;
@@ -399,16 +411,23 @@ pub fn eval_cfa_rule<R: Reader, UR: DwarfUnwindRegs, S: EvaluationStorage<R>>(
         }
         CfaRule::Expression(expr) => {
             let expr = expr.get(section).ok()?;
-            eval_expr::<R, UR, S>(expr, encoding, regs)
+            eval_expr::<R, UR, S, F>(expr, encoding, regs, read_stack)
         }
     }
 }
 
-fn eval_expr<R: Reader, UR: DwarfUnwindRegs, S: EvaluationStorage<R>>(
+fn eval_expr<R, UR, S, F>(
     expr: Expression<R>,
     encoding: Encoding,
     regs: &UR,
-) -> Option<u64> {
+    read_stack: &mut F,
+) -> Option<u64>
+where
+    R: Reader,
+    UR: DwarfUnwindRegs,
+    S: EvaluationStorage<R>,
+    F: FnMut(u64) -> Result<u64, ()>,
+{
     let mut eval = Evaluation::<R, S>::new_in(expr.0, encoding);
     let mut result = eval.evaluate().ok()?;
     loop {
@@ -417,6 +436,11 @@ fn eval_expr<R: Reader, UR: DwarfUnwindRegs, S: EvaluationStorage<R>>(
             EvaluationResult::RequiresRegister { register, .. } => {
                 let value = regs.get(register)?;
                 result = eval.resume_with_register(Value::Generic(value as _)).ok()?;
+            }
+            // Signal trampolines locate the interrupted registers by reading the stack.
+            EvaluationResult::RequiresMemory { address, size: 8, space: None, .. } => {
+                let value = read_stack(address).ok()?;
+                result = eval.resume_with_memory(Value::Generic(value)).ok()?;
             }
             _ => return None,
         }
@@ -459,12 +483,12 @@ where
         RegisterRule::Register(register) => regs.get(register),
         RegisterRule::Expression(expr) => {
             let expr = expr.get(section).ok()?;
-            let val = eval_expr::<R, UR, S>(expr, encoding, regs)?;
+            let val = eval_expr::<R, UR, S, F>(expr, encoding, regs, read_stack)?;
             read_stack(val).ok()
         }
         RegisterRule::ValExpression(expr) => {
             let expr = expr.get(section).ok()?;
-            eval_expr::<R, UR, S>(expr, encoding, regs)
+            eval_expr::<R, UR, S, F>(expr, encoding, regs, read_stack)
         }
         RegisterRule::Architectural => {
             // Unimplemented

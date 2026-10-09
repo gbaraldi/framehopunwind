@@ -68,6 +68,10 @@ pub struct SlotInner {
     /// Effective `[lo, hi)` stack-read window for this walk.
     pub stack_lo: u64,
     pub stack_hi: u64,
+    /// A second window, or `(0, 0)`: the stack a signal interrupted, when the walk starts
+    /// on a signal stack.
+    pub stack_lo2: u64,
+    pub stack_hi2: u64,
 }
 
 /// A reusable unwinding slot: a hazard cell + a preallocated cache + per-walk state.
@@ -128,6 +132,8 @@ fn placeholder_inner() -> SlotInner {
         snapshot: ptr::null(),
         stack_lo: 0,
         stack_hi: 0,
+        stack_lo2: 0,
+        stack_hi2: 0,
     }
 }
 

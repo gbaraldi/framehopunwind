@@ -143,6 +143,20 @@ pub fn cursor_init_bounds(
     stack_lo: u64,
     stack_hi: u64,
 ) -> c_int {
+    cursor_init_bounds2(cur, ctx, stack_lo, stack_hi, 0, 0)
+}
+
+/// Like [`cursor_init_bounds`], plus a second stack-read window `[stack_lo2, stack_hi2)`
+/// (ignored if empty), for a walk that starts on a signal stack and crosses into the stack
+/// the signal interrupted. Async-signal-safe.
+pub fn cursor_init_bounds2(
+    cur: *mut FhCursor,
+    ctx: *const FhContext,
+    stack_lo: u64,
+    stack_hi: u64,
+    stack_lo2: u64,
+    stack_hi2: u64,
+) -> c_int {
     // Write-only teardown: *cur may be uninitialized C memory, so never read it — which
     // also means a still-live cursor's slot is NOT released here (fini before re-init).
     // SAFETY: cur is valid for writes.
@@ -189,6 +203,11 @@ pub fn cursor_init_bounds(
     inner.snapshot = snap;
     inner.stack_lo = lo;
     inner.stack_hi = hi;
+    (inner.stack_lo2, inner.stack_hi2) = if stack_lo2 < stack_hi2 {
+        (stack_lo2, stack_hi2)
+    } else {
+        (0, 0)
+    };
 
     // SAFETY: cur is valid for writes (see above).
     unsafe {
@@ -263,12 +282,17 @@ pub fn step(cur: *mut FhCursor, out_ip: *mut u64, out_sp: *mut u64) -> c_int {
 
     let stack_lo = inner.stack_lo;
     let stack_hi = inner.stack_hi;
+    let stack_lo2 = inner.stack_lo2;
+    let stack_hi2 = inner.stack_hi2;
     let mut read_stack = move |addr: u64| -> Result<u64, ()> {
         // Bounded + aligned read of the target stack. This caps how far a stray pointer
         // can reach but is fault-*bounded*, not fault-free: with only the SP-derived
         // fallback window the range may include unmapped pages, so the read below can still
         // fault and the embedder must catch SIGSEGV (Julia: jl_set_safe_restore).
-        if addr < stack_lo || addr.saturating_add(8) > stack_hi || (addr & 0x7) != 0 {
+        let end = addr.saturating_add(8);
+        let in_window = addr >= stack_lo && end <= stack_hi;
+        let in_window2 = addr >= stack_lo2 && end <= stack_hi2;
+        if !(in_window || in_window2) || (addr & 0x7) != 0 {
             return Err(());
         }
         // SAFETY: addr is within the thread's stack window and 8-aligned. With exact
@@ -279,19 +303,29 @@ pub fn step(cur: *mut FhCursor, out_ip: *mut u64, out_sp: *mut u64) -> c_int {
 
     // Disjoint field borrows of `*inner`: cur_addr (Copy), &mut regs, &mut cache.
     let cur_addr = inner.cur_addr;
-    let result =
-        snap.unw
-            .unwind_frame(cur_addr, &mut inner.regs, &mut inner.cache, &mut read_stack);
+    let result = snap.unw.unwind_frame_signal_aware(
+        cur_addr,
+        &mut inner.regs,
+        &mut inner.cache,
+        &mut read_stack,
+    );
 
     match result {
         // Total match (no unwrap): a null return address ends the stack, matching
         // framehop's iterator. framehop can legitimately surface Ok(Some(0)) via its
         // Uncacheable path, so this must be handled, not asserted — the read path must
         // never panic across the FFI boundary.
-        Ok(Some(return_address)) => match core::num::NonZeroU64::new(return_address) {
+        Ok(Some((return_address, interrupted))) => match core::num::NonZeroU64::new(return_address)
+        {
             Some(ra) => {
                 inner.cur_ip = ra.get();
-                inner.cur_addr = FrameAddress::ReturnAddress(ra);
+                // Past a signal frame, the caller stopped at this exact instruction, so
+                // unwind it like a first frame.
+                inner.cur_addr = if interrupted {
+                    FrameAddress::from_instruction_pointer(ra.get())
+                } else {
+                    FrameAddress::ReturnAddress(ra)
+                };
                 1 // more frames may follow
             }
             None => {

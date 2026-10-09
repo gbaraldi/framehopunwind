@@ -16,5 +16,13 @@ or freeing is introduced on the unwind path. On 64-bit targets the wider keys
 add 8 bytes per x86-64 cache entry (509 entries per cursor); the aarch64
 entry size remains 24 bytes due to its existing layout.
 
+Local patch: x86-64 DWARF unwinding steps through signal trampolines. Expression
+rules may read memory (through the bounded stack reader), which glibc's
+`__restore_rt` needs to locate the interrupted registers. For an FDE whose CIE
+marks a signal frame, the generic path is always taken, the stack pointer may
+move to another stack, and the result is reported as `Interrupted`, so callers
+unwind the interrupted frame from its exact address
+(`Unwinder::unwind_frame_signal_aware`). `unwind_frame` is unchanged.
+
 Remove this vendored copy once an upstream release provides equivalent
-non-reusing module generations.
+non-reusing module generations and signal-frame unwinding.

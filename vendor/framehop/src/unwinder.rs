@@ -72,6 +72,24 @@ pub trait Unwinder: Clone {
     where
         F: FnMut(u64) -> Result<u64, ()>;
 
+    /// Like [`unwind_frame`](Self::unwind_frame), but also returns whether the frame was a
+    /// signal trampoline. The returned address is then where the caller was interrupted, so
+    /// unwind the caller from a [`FrameAddress::InstructionPointer`].
+    fn unwind_frame_signal_aware<F>(
+        &self,
+        address: FrameAddress,
+        regs: &mut Self::UnwindRegs,
+        cache: &mut Self::Cache,
+        read_stack: &mut F,
+    ) -> Result<Option<(u64, bool)>, Error>
+    where
+        F: FnMut(u64) -> Result<u64, ()>,
+    {
+        Ok(self
+            .unwind_frame(address, regs, cache, read_stack)?
+            .map(|address| (address, false)))
+    }
+
     /// Return an iterator that unwinds frame by frame until the end of the stack is found.
     fn iter_frames<'u, 'c, 'r, F>(
         &'u self,
@@ -326,7 +344,7 @@ impl<D: Deref<Target = [u8]>, A: Unwinding, P: AllocationPolicy> UnwinderInterna
         cache: &mut Cache<A::UnwindRule, P>,
         read_stack: &mut F,
         callback: G,
-    ) -> Result<Option<u64>, Error>
+    ) -> Result<Option<(u64, bool)>, Error>
     where
         F: FnMut(u64) -> Result<u64, ()>,
         G: FnOnce(
@@ -345,7 +363,7 @@ impl<D: Deref<Target = [u8]>, A: Unwinding, P: AllocationPolicy> UnwinderInterna
             .lookup(lookup_address, self.modules_generation)
         {
             CacheResult::Hit(unwind_rule) => {
-                return unwind_rule.exec(is_first_frame, regs, read_stack);
+                return not_interrupted(unwind_rule.exec(is_first_frame, regs, read_stack));
             }
             CacheResult::Miss(handle) => handle,
         };
@@ -364,8 +382,9 @@ impl<D: Deref<Target = [u8]>, A: Unwinding, P: AllocationPolicy> UnwinderInterna
                 ) {
                     Ok(UnwindResult::ExecRule(rule)) => rule,
                     Ok(UnwindResult::Uncacheable(return_address)) => {
-                        return Ok(Some(return_address))
+                        return Ok(Some((return_address, false)))
                     }
+                    Ok(UnwindResult::Interrupted(address)) => return Ok(Some((address, true))),
                     Err(_err) => {
                         // eprintln!("Unwinder error: {}", err);
                         A::UnwindRule::fallback_rule()
@@ -374,7 +393,7 @@ impl<D: Deref<Target = [u8]>, A: Unwinding, P: AllocationPolicy> UnwinderInterna
             }
         };
         cache.rule_cache.insert(cache_handle, unwind_rule);
-        unwind_rule.exec(is_first_frame, regs, read_stack)
+        not_interrupted(unwind_rule.exec(is_first_frame, regs, read_stack))
     }
 
     pub fn unwind_frame<F>(
@@ -384,6 +403,21 @@ impl<D: Deref<Target = [u8]>, A: Unwinding, P: AllocationPolicy> UnwinderInterna
         cache: &mut Cache<A::UnwindRule, P>,
         read_stack: &mut F,
     ) -> Result<Option<u64>, Error>
+    where
+        F: FnMut(u64) -> Result<u64, ()>,
+    {
+        Ok(self
+            .unwind_frame_signal_aware(address, regs, cache, read_stack)?
+            .map(|(address, _)| address))
+    }
+
+    pub fn unwind_frame_signal_aware<F>(
+        &self,
+        address: FrameAddress,
+        regs: &mut A::UnwindRegs,
+        cache: &mut Cache<A::UnwindRule, P>,
+        read_stack: &mut F,
+    ) -> Result<Option<(u64, bool)>, Error>
     where
         F: FnMut(u64) -> Result<u64, ()>,
     {
@@ -982,4 +1016,8 @@ mod generation_tests {
         assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
         assert!(std::panic::catch_unwind(|| next_modules_generation(&counter)).is_err());
     }
+}
+
+fn not_interrupted(result: Result<Option<u64>, Error>) -> Result<Option<(u64, bool)>, Error> {
+    Ok(result?.map(|address| (address, false)))
 }
