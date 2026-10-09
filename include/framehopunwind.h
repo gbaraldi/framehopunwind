@@ -14,8 +14,7 @@
  *
  *   * Mutating path (NOT async-signal-safe): fh_init, fh_thread_register,
  *     fh_modules_refresh, fh_register_jit, fh_deregister_jit. Call off the signal path
- *     (startup, dlopen, JIT compile), where Julia already serializes with
- *     jl_profile_atomic.
+ *     (startup, dlopen, JIT compile). They need no exclusion from concurrent walks.
  *
  * ---------------------------------------------------------------------------
  * Fault & cursor-slot lifetime contract (IMPORTANT — read before consuming)

@@ -19,8 +19,8 @@
 //! [`fh_cursor_init`], [`fh_step`], [`fh_get_reg`], [`fh_cursor_fini`] — is
 //! async-signal-safe: no allocation, no locks, no `free`. The **mutating path**
 //! ([`fh_init`], [`fh_register_jit`], [`fh_modules_refresh`], …) is not, and is meant to
-//! run off the signal path (JIT compile time, dlopen, startup), exactly where Julia
-//! already serializes with `jl_profile_atomic`.
+//! run off the signal path (JIT compile time, dlopen, startup). It needs no exclusion from
+//! concurrent walks.
 //!
 //! ## Supported targets
 //!

@@ -25,7 +25,7 @@ See [`include/framehopunwind.h`](include/framehopunwind.h) for the full, documen
 The split is deliberate:
 
 * **Read path — async-signal-safe** (`fh_capture_context`, `fh_context_from_ucontext`, `fh_cursor_init`, `fh_step`, `fh_get_reg`, `fh_cursor_fini`): no heap allocation (framehop `MustNotAllocateDuringUnwind` + a preallocated per-cursor `Cache`), no locks (module set read via a hand-rolled hazard-pointer snapshot, never the writer mutex), no `free` (retired snapshots are reclaimed only on the writer thread). `panic = "abort"` in release prevents unwinding across the FFI boundary.
-* **Mutating path — NOT signal-safe** (`fh_init`, `fh_thread_register`, `fh_modules_refresh`, `fh_register_jit*`, `fh_deregister_jit*`): runs off the signal path (startup, dlopen, JIT compile), exactly where Julia already serializes with `jl_profile_atomic`.
+* **Mutating path — NOT signal-safe** (`fh_init`, `fh_thread_register`, `fh_modules_refresh`, `fh_register_jit*`, `fh_deregister_jit*`): runs off the signal path (startup, dlopen, JIT compile). It needs no exclusion from concurrent walks, which read an immutable snapshot.
 
 The one bounded resource is the cursor **slot pool** (`fh_init(num_slots)`, default 256). If every slot is busy, `fh_cursor_init` returns an error and that sample is skipped — it never blocks or allocates.
 
