@@ -763,3 +763,39 @@ mod signal_frame {
         );
     }
 }
+
+/// Prints the cost of one JIT registration as registered modules accumulate. Run with
+/// `cargo test --release -- --ignored --nocapture jit_registration_cost`.
+#[test]
+#[ignore]
+fn jit_registration_cost() {
+    ensure_init();
+    let base = 0x20_0000_0000u64;
+    let total = 20_000u64;
+    let eh: Vec<Vec<u8>> = (0..total)
+        .map(|i| synthetic_eh_frame(base + i * 0x1000, 0x800))
+        .collect();
+    let mut start = std::time::Instant::now();
+    for i in 0..total {
+        let text_lo = base + i * 0x1000;
+        let rc = crate::modules::register_jit_eh_frame(
+            eh[i as usize].as_ptr(),
+            eh[i as usize].len(),
+            text_lo,
+            text_lo + 0x800,
+        );
+        assert_eq!(rc, 0);
+        if (i + 1) % 5000 == 0 {
+            let per = start.elapsed().as_secs_f64() / 5000.0;
+            println!(
+                "modules {:>6}: {:8.1} us per registration",
+                i + 1,
+                per * 1e6
+            );
+            start = std::time::Instant::now();
+        }
+    }
+    for i in 0..total {
+        crate::modules::deregister_jit_eh_frame(eh[i as usize].as_ptr());
+    }
+}

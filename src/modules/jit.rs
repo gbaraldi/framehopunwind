@@ -87,8 +87,10 @@ pub fn register_jit_eh_frame(
         ..Default::default()
     };
 
+    // framehop keeps the name only for debugging, and every module-list update clones every
+    // module's name; an empty one costs no allocation, which matters with many JIT modules.
     let module = Module::new(
-        format!("<jit:{text_lo:#x}>"),
+        String::new(),
         Range {
             start: text_lo,
             end: text_hi,

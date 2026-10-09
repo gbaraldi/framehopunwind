@@ -55,6 +55,8 @@ struct Registry {
     /// that only retain the eh_frame pointer (e.g. Julia's `deregister_eh_frames`) can
     /// deregister without recomputing the code range.
     jit_by_eh_frame: HashMap<u64, u64>,
+    /// The reverse of `jit_by_eh_frame`.
+    jit_eh_frame_by_key: HashMap<u64, u64>,
     /// ELF: the loader's load/unload counts at the last scan; see `elf::load_counts`.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     load_counts: Option<(u64, u64)>,
@@ -71,6 +73,7 @@ static REGISTRY: LazyLock<Mutex<Registry>> = LazyLock::new(|| {
         static_mods: HashMap::new(),
         jit_keys: HashSet::new(),
         jit_by_eh_frame: HashMap::new(),
+        jit_eh_frame_by_key: HashMap::new(),
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         load_counts: None,
         #[cfg(target_os = "macos")]
@@ -277,8 +280,21 @@ pub(crate) fn add_jit_module(key: u64, eh_frame_addr: u64, module: Module<Bytes>
     reg.jit_keys.insert(key);
     // Purge any previous eh_frame mapping for this key so a late deregister with a stale
     // pointer cannot delete the module we are registering now.
-    reg.jit_by_eh_frame.retain(|_, v| *v != key);
-    reg.jit_by_eh_frame.insert(eh_frame_addr, key);
+    forget_jit_eh_frame(&mut reg, key);
+    if let Some(prev_key) = reg.jit_by_eh_frame.insert(eh_frame_addr, key) {
+        // That module can no longer be deregistered by this eh_frame address.
+        reg.jit_eh_frame_by_key.remove(&prev_key);
+    }
+    reg.jit_eh_frame_by_key.insert(key, eh_frame_addr);
+}
+
+/// Drop `key`'s eh_frame mapping, if it still has one.
+fn forget_jit_eh_frame(reg: &mut Registry, key: u64) {
+    if let Some(eh_frame_addr) = reg.jit_eh_frame_by_key.remove(&key) {
+        if reg.jit_by_eh_frame.get(&eh_frame_addr) == Some(&key) {
+            reg.jit_by_eh_frame.remove(&eh_frame_addr);
+        }
+    }
 }
 
 /// Remove a JIT module keyed by `key`, with the registry lock already held. Keeping
@@ -291,7 +307,7 @@ fn remove_jit_locked(reg: &mut Registry, key: u64) {
         unw.remove_module(key);
     });
     reg.jit_keys.remove(&key);
-    reg.jit_by_eh_frame.retain(|_, v| *v != key);
+    forget_jit_eh_frame(reg, key);
 }
 
 /// Remove a JIT module keyed by `key` (== the `text_lo` used at registration).
