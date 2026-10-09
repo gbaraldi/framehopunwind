@@ -215,6 +215,34 @@ extern "C" fn callback(
     0
 }
 
+/// The loader's counts of objects ever loaded and unloaded, or `None` if the C library does
+/// not report them. Equal counts mean the set of loaded objects has not changed.
+pub fn load_counts() -> Option<(u64, u64)> {
+    extern "C" fn first(
+        info: *mut libc::dl_phdr_info,
+        size: libc::size_t,
+        data: *mut libc::c_void,
+    ) -> libc::c_int {
+        let end = core::mem::offset_of!(libc::dl_phdr_info, dlpi_subs)
+            + core::mem::size_of::<libc::c_ulonglong>();
+        // Older C libraries pass a shorter struct without the counts.
+        if size >= end {
+            // SAFETY: libc guarantees `info` is valid for the call and `size` bytes long;
+            // `data` is the `Option` passed below.
+            let info = unsafe { &*info };
+            let counts = unsafe { &mut *(data as *mut Option<(u64, u64)>) };
+            *counts = Some((info.dlpi_adds, info.dlpi_subs));
+        }
+        1 // every entry carries the same counts
+    }
+    let mut counts: Option<(u64, u64)> = None;
+    // SAFETY: standard dl_iterate_phdr usage; the callback only reads its arguments.
+    unsafe {
+        libc::dl_iterate_phdr(Some(first), &mut counts as *mut _ as *mut libc::c_void);
+    }
+    counts
+}
+
 /// Find the end AVMA of the PT_LOAD segment containing `addr`.
 fn containing_segment_end(phdrs: &[libc::Elf64_Phdr], bias: u64, addr: u64) -> Option<u64> {
     for ph in phdrs {

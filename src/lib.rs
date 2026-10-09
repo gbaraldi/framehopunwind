@@ -124,7 +124,9 @@ mod api {
         crate::stackbounds::register_current_thread();
     }
 
-    /// Re-scan loaded modules (call after `dlopen`/`dlclose`). Not async-signal-safe.
+    /// Re-scan loaded modules (call after `dlopen`/`dlclose`). On Linux and FreeBSD it
+    /// returns after one quick check when nothing was loaded or unloaded since the last scan.
+    /// Not async-signal-safe.
     #[no_mangle]
     pub extern "C" fn fh_modules_refresh() {
         crate::modules::refresh();

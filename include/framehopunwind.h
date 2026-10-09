@@ -125,8 +125,10 @@ int fh_init(size_t num_slots);
 void fh_thread_register(void);
 
 /* Re-scan loaded modules (call after dlopen AND dlclose; JIT modules are preserved).
- * On macOS this is a no-op once fh_init has run: dyld's add/remove-image callbacks keep
- * the module set current automatically. */
+ * On Linux and FreeBSD, when nothing was loaded or unloaded since the last scan, it
+ * returns after one quick check, so it can also be called before walks that may cross
+ * libraries loaded by other code. On macOS this is a no-op once fh_init has run: dyld's
+ * add/remove-image callbacks keep the module set current automatically. */
 void fh_modules_refresh(void);
 
 /* Diagnostics: number of JIT modules currently registered, and the cumulative count of

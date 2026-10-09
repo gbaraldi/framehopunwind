@@ -55,6 +55,9 @@ struct Registry {
     /// that only retain the eh_frame pointer (e.g. Julia's `deregister_eh_frames`) can
     /// deregister without recomputing the code range.
     jit_by_eh_frame: HashMap<u64, u64>,
+    /// ELF: the loader's load/unload counts at the last scan; see `elf::load_counts`.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    load_counts: Option<(u64, u64)>,
     /// macOS: add-image events recorded during the initial dyld callback replay, published
     /// in one batch by `macos_end_batch` (one snapshot instead of one per preloaded image).
     #[cfg(target_os = "macos")]
@@ -68,6 +71,8 @@ static REGISTRY: LazyLock<Mutex<Registry>> = LazyLock::new(|| {
         static_mods: HashMap::new(),
         jit_keys: HashSet::new(),
         jit_by_eh_frame: HashMap::new(),
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        load_counts: None,
         #[cfg(target_os = "macos")]
         batching: false,
         #[cfg(target_os = "macos")]
@@ -95,6 +100,16 @@ pub fn init() {
 #[cfg(not(target_os = "macos"))]
 pub fn refresh() {
     let mut reg = registry();
+    // Equal counts mean no object was loaded or unloaded since the last scan. Read them
+    // before scanning, so a load during the scan is picked up by the next refresh.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    let counts = {
+        let counts = elf::load_counts();
+        if counts.is_some() && counts == reg.load_counts {
+            return;
+        }
+        counts
+    };
     let res = match enumerate_static(&reg.static_mods) {
         Some(r) => r,
         None => return, // enumeration failed; keep the current snapshot
@@ -120,6 +135,10 @@ pub fn refresh() {
         .map(|(k, _)| *k)
         .collect();
 
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    {
+        reg.load_counts = counts;
+    }
     if new_modules.is_empty() && removed.is_empty() && changed.is_empty() {
         return; // nothing changed
     }
