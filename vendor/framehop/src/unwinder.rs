@@ -243,9 +243,15 @@ cfg_if::cfg_if! {
     }
 }
 
+/// The most modules a chunk of the module list holds after a split; see
+/// [`UnwinderInternal::modules`].
+const MODULE_CHUNK: usize = 64;
+
 pub struct UnwinderInternal<D, A, P> {
-    /// sorted by avma_range.start
-    modules: Vec<Module<D>>,
+    /// Sorted by avma_range.start, in non-empty chunks of up to `2 * MODULE_CHUNK` modules.
+    /// Cloning the unwinder copies only the chunk pointers, and a change copies only the
+    /// chunk it touches, so updating a shared module list stays cheap as it grows.
+    modules: Vec<Arc<Vec<Module<D>>>>,
     /// Incremented every time modules is changed.
     modules_generation: u64,
     _arch: PhantomData<A>,
@@ -278,55 +284,87 @@ impl<D, A, P> UnwinderInternal<D, A, P> {
             _allocation_policy: PhantomData,
         }
     }
+
+    /// The chunk that holds the module with the highest start at or below `address`, or the
+    /// first chunk if there is none. Only valid if there is at least one chunk.
+    fn chunk_index_for(&self, address: u64) -> usize {
+        match self
+            .modules
+            .binary_search_by_key(&address, |chunk| chunk[0].avma_range.start)
+        {
+            Ok(i) => i,
+            Err(0) => 0,
+            Err(i) => i - 1,
+        }
+    }
 }
 
 impl<D: Deref<Target = [u8]>, A: Unwinding, P: AllocationPolicy> UnwinderInternal<D, A, P> {
     pub fn add_module(&mut self, module: Module<D>) {
-        let insertion_index = match self
-            .modules
-            .binary_search_by_key(&module.avma_range.start, |module| module.avma_range.start)
-        {
-            Ok(i) => i, // unexpected
-            Err(i) => i,
-        };
-        self.modules.insert(insertion_index, module);
+        if self.modules.is_empty() {
+            self.modules.push(Arc::new(Vec::from([module])));
+        } else {
+            let chunk_index = self.chunk_index_for(module.avma_range.start);
+            let chunk = Arc::make_mut(&mut self.modules[chunk_index]);
+            let insertion_index = match chunk
+                .binary_search_by_key(&module.avma_range.start, |module| module.avma_range.start)
+            {
+                Ok(i) => i, // unexpected
+                Err(i) => i,
+            };
+            chunk.insert(insertion_index, module);
+            if chunk.len() > 2 * MODULE_CHUNK {
+                let tail = chunk.split_off(MODULE_CHUNK);
+                self.modules.insert(chunk_index + 1, Arc::new(tail));
+            }
+        }
         self.modules_generation = next_global_modules_generation();
     }
 
     pub fn remove_module(&mut self, module_address_range_start: u64) {
-        if let Ok(index) = self
-            .modules
+        if self.modules.is_empty() {
+            return;
+        }
+        let chunk_index = self.chunk_index_for(module_address_range_start);
+        if let Ok(index) = self.modules[chunk_index]
             .binary_search_by_key(&module_address_range_start, |module| {
                 module.avma_range.start
             })
         {
-            self.modules.remove(index);
+            let chunk = Arc::make_mut(&mut self.modules[chunk_index]);
+            chunk.remove(index);
+            if chunk.is_empty() {
+                self.modules.remove(chunk_index);
+            }
             self.modules_generation = next_global_modules_generation();
         };
     }
 
     pub fn max_known_code_address(&self) -> u64 {
-        self.modules.last().map_or(0, |m| m.avma_range.end)
+        self.modules
+            .last()
+            .and_then(|chunk| chunk.last())
+            .map_or(0, |m| m.avma_range.end)
     }
 
-    fn find_module_for_address(&self, address: u64) -> Option<(usize, u32)> {
-        let (module_index, module) = match self
-            .modules
-            .binary_search_by_key(&address, |m| m.avma_range.start)
-        {
-            Ok(i) => (i, &self.modules[i]),
+    fn find_module_for_address(&self, address: u64) -> Option<(&Module<D>, u32)> {
+        if self.modules.is_empty() {
+            return None;
+        }
+        let chunk = &self.modules[self.chunk_index_for(address)];
+        let module = match chunk.binary_search_by_key(&address, |m| m.avma_range.start) {
+            Ok(i) => &chunk[i],
             Err(insertion_index) => {
                 if insertion_index == 0 {
                     // address is before first known module
                     return None;
                 }
-                let i = insertion_index - 1;
-                let module = &self.modules[i];
+                let module = &chunk[insertion_index - 1];
                 if module.avma_range.end <= address {
                     // address is after this module
                     return None;
                 }
-                (i, module)
+                module
             }
         };
         if address < module.base_avma {
@@ -334,7 +372,7 @@ impl<D: Deref<Target = [u8]>, A: Unwinding, P: AllocationPolicy> UnwinderInterna
             return None;
         }
         let relative_address = u32::try_from(address - module.base_avma).ok()?;
-        Some((module_index, relative_address))
+        Some((module, relative_address))
     }
 
     fn with_cache<F, G>(
@@ -370,8 +408,7 @@ impl<D: Deref<Target = [u8]>, A: Unwinding, P: AllocationPolicy> UnwinderInterna
 
         let unwind_rule = match self.find_module_for_address(lookup_address) {
             None => A::UnwindRule::fallback_rule(),
-            Some((module_index, relative_lookup_address)) => {
-                let module = &self.modules[module_index];
+            Some((module, relative_lookup_address)) => {
                 match callback(
                     module,
                     address,
@@ -1020,4 +1057,95 @@ mod generation_tests {
 
 fn not_interrupted(result: Result<Option<u64>, Error>) -> Result<Option<(u64, bool)>, Error> {
     Ok(result?.map(|address| (address, false)))
+}
+
+#[cfg(test)]
+mod module_chunk_tests {
+    use super::*;
+    use crate::cache::MayAllocateDuringUnwind;
+    use crate::x86_64::ArchX86_64;
+
+    type Unw = UnwinderInternal<Vec<u8>, ArchX86_64, MayAllocateDuringUnwind>;
+
+    const SPAN: u64 = 0x100;
+
+    fn module(start: u64) -> Module<Vec<u8>> {
+        Module::new(
+            String::new(),
+            start..start + SPAN,
+            start,
+            ExplicitModuleSectionInfo::<Vec<u8>>::default(),
+        )
+    }
+
+    fn check(unw: &Unw, reference: &[u64]) {
+        let mut last_start = None;
+        for chunk in &unw.modules {
+            assert!(!chunk.is_empty() && chunk.len() <= 2 * MODULE_CHUNK);
+            for m in chunk.iter() {
+                assert!(last_start < Some(m.avma_range.start));
+                last_start = Some(m.avma_range.start);
+            }
+        }
+        let starts: Vec<u64> = unw
+            .modules
+            .iter()
+            .flat_map(|c| c.iter().map(|m| m.avma_range.start))
+            .collect();
+        assert_eq!(starts, reference);
+        assert_eq!(
+            unw.max_known_code_address(),
+            reference.last().map_or(0, |s| s + SPAN)
+        );
+        for slot in 0..2001u64 {
+            for addr in [slot * 0x1000, slot * 0x1000 + SPAN - 1, slot * 0x1000 + SPAN] {
+                let expected = reference
+                    .iter()
+                    .copied()
+                    .find(|&s| s <= addr && addr < s + SPAN);
+                let found = unw
+                    .find_module_for_address(addr)
+                    .map(|(m, _)| m.avma_range.start);
+                assert_eq!(found, expected, "lookup of {addr:#x}");
+            }
+        }
+    }
+
+    #[test]
+    fn chunked_module_list_matches_a_sorted_list() {
+        let mut unw = Unw::new();
+        let mut reference: Vec<u64> = Vec::new();
+        let mut snapshots = Vec::new();
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        for step in 0..6000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let start = 0x1000 * (x % 2000);
+            match reference.binary_search(&start) {
+                Ok(i) => {
+                    if x & 1 == 0 {
+                        unw.remove_module(start);
+                        reference.remove(i);
+                    }
+                }
+                Err(i) => {
+                    unw.add_module(module(start));
+                    reference.insert(i, start);
+                }
+            }
+            if step % 600 == 0 {
+                snapshots.push((unw.clone(), reference.clone()));
+            }
+        }
+        // removing an absent module changes nothing
+        let generation = unw.modules_generation;
+        unw.remove_module(0x1000 * 5000);
+        assert_eq!(unw.modules_generation, generation);
+        snapshots.push((unw.clone(), reference.clone()));
+        // earlier clones must not see later changes
+        for (unw, reference) in &snapshots {
+            check(unw, reference);
+        }
+    }
 }

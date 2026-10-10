@@ -24,5 +24,11 @@ move to another stack, and the result is reported as `Interrupted`, so callers
 unwind the interrupted frame from its exact address
 (`Unwinder::unwind_frame_signal_aware`). `unwind_frame` is unchanged.
 
+Local patch: the module list is kept in shared chunks of up to 128 modules,
+so cloning an unwinder copies chunk pointers and a change copies only the chunk
+it touches. framehopunwind publishes a clone on every module change, which made
+each JIT registration proportional to the number of modules.
+
 Remove this vendored copy once an upstream release provides equivalent
-non-reusing module generations and signal-frame unwinding.
+non-reusing module generations, signal-frame unwinding, and cheap module-list
+updates.
