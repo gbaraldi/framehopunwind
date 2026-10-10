@@ -22,8 +22,8 @@
 
 use core::cell::UnsafeCell;
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use framehop::{
     CacheNative, FrameAddress, MustNotAllocateDuringUnwind, UnwindRegsNative, Unwinder,
@@ -150,43 +150,79 @@ unsafe impl Send for WriterState {}
 /// The currently published snapshot. Null until the first publish.
 static CURRENT: AtomicPtr<Snapshot> = AtomicPtr::new(ptr::null_mut());
 
-/// The slot pool, allocated once by [`init`].
-static SLOTS: OnceLock<Box<[Slot]>> = OnceLock::new();
+/// Slots per chunk of the slot pool.
+const SLOT_CHUNK: usize = 16;
+/// The most chunks the pool grows to.
+const MAX_SLOT_CHUNKS: usize = 64;
+
+/// The slot pool, in chunks that are published once and never freed, so the signal path
+/// can scan them without locks. Grown by [`ensure_slots`], off the signal path. SeqCst
+/// publication keeps a reclaiming writer from missing a chunk a reader has claimed from.
+static SLOT_CHUNKS: [AtomicPtr<Slot>; MAX_SLOT_CHUNKS] =
+    [const { AtomicPtr::new(ptr::null_mut()) }; MAX_SLOT_CHUNKS];
+/// Serializes pool growth; holds the number of slots allocated.
+static SLOTS_ALLOCATED: Mutex<usize> = Mutex::new(0);
+/// Threads registered with [`thread_registered`].
+static REGISTERED_THREADS: AtomicUsize = AtomicUsize::new(0);
 
 /// Serializes writers and guards the retired list. Never taken on the signal path.
 static WRITER: Mutex<WriterState> = Mutex::new(WriterState {
     retired: Vec::new(),
 });
 
-const DEFAULT_SLOTS: usize = 256;
+/// Slots allocated by `init(0)`, before any thread registers.
+const DEFAULT_SLOTS: usize = 16;
+/// Slots added per registered thread: one for its own walks, one for a walk from a signal
+/// handler that interrupts it.
+const SLOTS_PER_THREAD: usize = 2;
 
-/// Initialize the slot pool. Idempotent; `num_slots == 0` selects a default.
-/// Must be called off the signal path (it allocates the caches).
+/// Allocate the initial slot pool: `num_slots`, or a default if 0. Off the signal path.
 pub fn init(num_slots: usize) {
-    SLOTS.get_or_init(|| {
-        let n = if num_slots == 0 {
-            DEFAULT_SLOTS
-        } else {
-            num_slots
-        };
-        let mut v = Vec::with_capacity(n);
-        for _ in 0..n {
-            v.push(Slot::new());
-        }
-        v.into_boxed_slice()
+    ensure_slots(if num_slots == 0 {
+        DEFAULT_SLOTS
+    } else {
+        num_slots
     });
 }
 
+/// Grow the pool for one more thread that runs the unwinder. Off the signal path.
+pub fn thread_registered() {
+    let threads = REGISTERED_THREADS.fetch_add(1, Ordering::Relaxed) + 1;
+    ensure_slots(DEFAULT_SLOTS + SLOTS_PER_THREAD * threads);
+}
+
+/// Grow the pool to at least `n` slots (rounded up to whole chunks, up to the maximum).
+/// Off the signal path: it allocates the slots' caches.
+fn ensure_slots(n: usize) {
+    let mut allocated = SLOTS_ALLOCATED.lock().unwrap_or_else(|e| e.into_inner());
+    while *allocated < n && *allocated < SLOT_CHUNK * MAX_SLOT_CHUNKS {
+        let chunk: Box<[Slot]> = (0..SLOT_CHUNK).map(|_| Slot::new()).collect();
+        let first = Box::leak(chunk).as_mut_ptr();
+        SLOT_CHUNKS[*allocated / SLOT_CHUNK].store(first, Ordering::SeqCst);
+        *allocated += SLOT_CHUNK;
+    }
+}
+
 #[inline]
-fn slots() -> Option<&'static [Slot]> {
-    SLOTS.get().map(|b| &b[..])
+fn slot_chunk(i: usize) -> Option<&'static [Slot]> {
+    let first = SLOT_CHUNKS.get(i)?.load(Ordering::SeqCst);
+    if first.is_null() {
+        return None;
+    }
+    // SAFETY: a published chunk holds SLOT_CHUNK initialized slots and is never freed.
+    Some(unsafe { core::slice::from_raw_parts(first, SLOT_CHUNK) })
+}
+
+/// Every allocated slot, in index order. Signal-safe.
+#[inline]
+fn slots() -> impl Iterator<Item = &'static Slot> {
+    (0..MAX_SLOT_CHUNKS).map_while(slot_chunk).flatten()
 }
 
 /// Claim a free slot with a lock-free CAS scan. Signal-safe. Returns the slot index and
 /// the claim nonce the cursor must present on later access (see [`Slot::seq`]).
 pub fn claim_slot() -> Option<(usize, u64)> {
-    let slots = slots()?;
-    for (i, s) in slots.iter().enumerate() {
+    for (i, s) in slots().enumerate() {
         if s.in_use
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
@@ -210,7 +246,7 @@ pub fn nonce_matches(idx: usize, nonce: u64) -> bool {
 
 #[inline]
 pub fn slot(idx: usize) -> Option<&'static Slot> {
-    slots()?.get(idx)
+    slot_chunk(idx / SLOT_CHUNK)?.get(idx % SLOT_CHUNK)
 }
 
 /// Release a slot claimed with `nonce`: retire the claim, clear the hazard, mark the
@@ -273,14 +309,7 @@ pub fn acquire_snapshot(slot_idx: usize) -> *const Snapshot {
 
 /// True iff `p` is referenced by any hazard slot.
 fn is_hazarded(p: *mut Snapshot) -> bool {
-    if let Some(slots) = slots() {
-        for s in slots {
-            if s.hazard.load(Ordering::SeqCst) == p {
-                return true;
-            }
-        }
-    }
-    false
+    slots().any(|s| s.hazard.load(Ordering::SeqCst) == p)
 }
 
 /// Free any retired snapshots that no reader still references. Writer-thread only.
