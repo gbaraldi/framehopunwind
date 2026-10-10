@@ -91,8 +91,8 @@ mod api {
     /// Initialize the library: allocate the unwinding slot pool and enumerate the
     /// currently-loaded modules (on macOS, by installing dyld's add/remove-image
     /// callbacks, which keep the set current from then on). Idempotent. `num_slots == 0`
-    /// selects a default (256). Returns 0 on success. **Not** async-signal-safe; call
-    /// once at startup.
+    /// selects a default (16); `fh_thread_register` grows the pool. Returns 0 on success.
+    /// **Not** async-signal-safe; call once at startup.
     #[no_mangle]
     pub extern "C" fn fh_init(num_slots: usize) -> c_int {
         install_panic_hook();
@@ -117,11 +117,13 @@ mod api {
     #[cfg(not(all(panic = "abort", unix)))]
     fn install_panic_hook() {}
 
-    /// Capture per-thread state needed off the signal path: preallocated stack bounds.
-    /// Call once per thread that will be unwound (profiled), before any sampling.
+    /// Capture per-thread state needed off the signal path: preallocated stack bounds, and
+    /// two more slots in the pool. Call once per thread that will be unwound (profiled),
+    /// before any sampling.
     #[no_mangle]
     pub extern "C" fn fh_thread_register() {
         crate::stackbounds::register_current_thread();
+        crate::state::thread_registered();
     }
 
     /// Re-scan loaded modules (call after `dlopen`/`dlclose`). On Linux and FreeBSD it

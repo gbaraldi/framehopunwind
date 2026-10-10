@@ -799,3 +799,29 @@ fn jit_registration_cost() {
         crate::modules::deregister_jit_eh_frame(eh[i as usize].as_ptr());
     }
 }
+
+/// The slot pool starts small and grows as threads register.
+#[test]
+fn slot_pool_grows_with_registered_threads() {
+    ensure_init();
+    for _ in 0..10 {
+        state::thread_registered();
+    }
+    // At least 16 + 2 * 10 slots now exist; other tests may hold a few at any moment.
+    let mut claimed = Vec::new();
+    while let Some(c) = state::claim_slot() {
+        claimed.push(c);
+        if claimed.len() == 30 {
+            break;
+        }
+    }
+    assert_eq!(claimed.len(), 30, "pool did not grow");
+    let mut indices: Vec<usize> = claimed.iter().map(|&(i, _)| i).collect();
+    indices.sort_unstable();
+    indices.dedup();
+    assert_eq!(indices.len(), claimed.len(), "a slot was claimed twice");
+    for (i, nonce) in claimed {
+        assert!(state::nonce_matches(i, nonce));
+        state::release_slot(i, nonce);
+    }
+}

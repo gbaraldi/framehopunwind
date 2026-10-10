@@ -44,8 +44,9 @@
  * at exactly the wrong moment.
  *
  * A cursor owns a pooled slot (a preallocated unwind cache) from fh_cursor_init until
- * fh_cursor_fini. The pool is finite (fh_init's num_slots); if it is exhausted
- * fh_cursor_init returns <0 (skip that sample) — it never blocks or allocates.
+ * fh_cursor_fini. The pool starts at fh_init's num_slots and grows by two slots for
+ * each fh_thread_register, up to 1024; if it is exhausted fh_cursor_init returns <0
+ * (skip that sample) — it never blocks or allocates.
  *
  * A cursor is single-owner: do not copy the struct, share it across threads, or step it
  * concurrently. (A per-claim nonce makes fini on a stale copy or a racing double-fini a
@@ -115,12 +116,13 @@ int fh_supported(void);
 
 /* ---- lifecycle (NOT async-signal-safe) ---- */
 
-/* Allocate the unwinding slot pool (num_slots; 0 => default 256) and enumerate the
+/* Allocate the unwinding slot pool (num_slots; 0 => default 16) and enumerate the
  * currently-loaded modules. Idempotent. Returns 0 on success. Call once at startup. */
 int fh_init(size_t num_slots);
 
-/* Capture per-thread state needed off the signal path (stack bounds). Call once per
- * thread that will be unwound/profiled, before any sampling. */
+/* Capture per-thread state needed off the signal path (stack bounds), and grow the slot
+ * pool by two slots. Call once per thread that will be unwound/profiled, before any
+ * sampling. */
 void fh_thread_register(void);
 
 /* Re-scan loaded modules (call after dlopen AND dlclose; JIT modules are preserved).
