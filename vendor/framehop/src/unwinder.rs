@@ -216,11 +216,21 @@ fn next_global_modules_generation() -> u64 {
 }
 
 fn next_modules_generation(counter: &AtomicU64) -> u64 {
-    counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |generation| {
-            generation.checked_add(1)
-        })
-        .expect("module generation exhausted")
+    let mut generation = counter.load(Ordering::Relaxed);
+    loop {
+        let next = generation
+            .checked_add(1)
+            .expect("module generation exhausted");
+        match counter.compare_exchange_weak(
+            generation,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return generation,
+            Err(current) => generation = current,
+        }
+    }
 }
 
 cfg_if::cfg_if! {

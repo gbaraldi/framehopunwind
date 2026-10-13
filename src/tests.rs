@@ -738,7 +738,7 @@ mod signal_frame {
             let mut old_ss: libc::stack_t = core::mem::zeroed();
             assert_eq!(libc::sigaltstack(&ss, &mut old_ss), 0);
             let mut sa: libc::sigaction = core::mem::zeroed();
-            sa.sa_sigaction = handler as usize;
+            sa.sa_sigaction = handler as *const () as usize;
             sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
             libc::sigemptyset(&mut sa.sa_mask);
             let mut old_sa: libc::sigaction = core::mem::zeroed();
