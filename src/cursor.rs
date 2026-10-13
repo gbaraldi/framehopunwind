@@ -301,6 +301,23 @@ pub fn step(cur: *mut FhCursor, out_ip: *mut u64, out_sp: *mut u64) -> c_int {
         Ok(unsafe { core::ptr::read_volatile(addr as *const u64) })
     };
 
+    // Past the kernel's signal trampoline, the caller stopped at the restored pc, so
+    // unwind it like a first frame.
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    if crate::sigreturn::is_trampoline(inner.cur_ip) {
+        return match crate::sigreturn::restore(&mut inner.regs, &mut read_stack) {
+            Some(pc) if pc != 0 => {
+                inner.cur_ip = pc;
+                inner.cur_addr = FrameAddress::from_instruction_pointer(pc);
+                1
+            }
+            _ => {
+                inner.done = true;
+                0
+            }
+        };
+    }
+
     // Disjoint field borrows of `*inner`: cur_addr (Copy), &mut regs, &mut cache.
     let cur_addr = inner.cur_addr;
     let result = snap.unw.unwind_frame_signal_aware(
