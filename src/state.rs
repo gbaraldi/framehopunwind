@@ -30,11 +30,30 @@ use framehop::{
     UnwinderNative,
 };
 
-/// Owned unwind-section bytes. We always **copy** the unwind data (`.eh_frame`,
-/// `__unwind_info`, `.pdata`, …) into owned memory at registration time (off the signal
-/// path), so a snapshot is self-contained: a later `dlclose`/`munmap` or a Julia free of
-/// a JIT buffer cannot turn a snapshot into a dangling read.
-pub type Bytes = Box<[u8]>;
+/// Unwind-section and code bytes. A loaded object's are read in place (`Mapped`): a walk
+/// only looks up addresses on the stack it walks, and an object cannot be unloaded while
+/// its code is on a stack. A JIT module's `.eh_frame` is copied (`Owned`), so the embedder
+/// may free its buffer once it deregisters the module.
+pub enum Bytes {
+    Owned(Box<[u8]>),
+    Mapped(&'static [u8]),
+}
+
+impl core::ops::Deref for Bytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Bytes::Owned(bytes) => bytes,
+            Bytes::Mapped(bytes) => bytes,
+        }
+    }
+}
+
+impl Default for Bytes {
+    fn default() -> Self {
+        Bytes::Mapped(&[])
+    }
+}
 
 /// The native-arch framehop unwinder, using the allocation-free unwind policy.
 pub type Unw = UnwinderNative<Bytes, MustNotAllocateDuringUnwind>;
@@ -50,8 +69,8 @@ pub struct Snapshot {
 
 // SAFETY: A published `Snapshot` is immutable. `Unw::unwind_frame` takes `&self` and only
 // reads the module list (the mutable scratch state lives in the per-call `Cache` and the
-// `read_stack` closure, both owned exclusively by one cursor). `Bytes` is immutable owned
-// data. Therefore concurrent shared access from multiple unwinding threads is sound.
+// `read_stack` closure, both owned exclusively by one cursor). `Bytes` is immutable.
+// Therefore concurrent shared access from multiple unwinding threads is sound.
 unsafe impl Send for Snapshot {}
 unsafe impl Sync for Snapshot {}
 

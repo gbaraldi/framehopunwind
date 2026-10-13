@@ -516,10 +516,9 @@ mod jit_path {
         eh_frame_addr: u64,
         eh_frame_len: usize,
     ) -> Module<state::Bytes> {
-        let eh_frame_copy: state::Bytes =
-            unsafe { core::slice::from_raw_parts(eh_frame_addr as *const u8, eh_frame_len) }
-                .to_vec()
-                .into_boxed_slice();
+        let eh_frame_copy: state::Bytes = state::Bytes::Owned(Box::from(unsafe {
+            core::slice::from_raw_parts(eh_frame_addr as *const u8, eh_frame_len)
+        }));
         let info: ExplicitModuleSectionInfo<state::Bytes> = ExplicitModuleSectionInfo {
             base_svma: bias, // == base_avma == text_lo
             eh_frame: Some(eh_frame_copy),
