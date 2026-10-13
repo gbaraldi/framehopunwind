@@ -90,6 +90,8 @@ fn registry() -> std::sync::MutexGuard<'static, Registry> {
 /// Bring up static-module tracking: install the dyld callbacks on macOS (which replays
 /// all already-loaded images), or do an initial scan elsewhere. Idempotent.
 pub fn init() {
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    crate::sigreturn::init();
     #[cfg(target_os = "macos")]
     macho::init_callbacks();
     #[cfg(not(target_os = "macos"))]

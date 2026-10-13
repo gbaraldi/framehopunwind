@@ -39,6 +39,8 @@ mod capture;
 mod cursor;
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 mod modules;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+mod sigreturn;
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 mod stackbounds;
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]

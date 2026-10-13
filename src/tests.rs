@@ -18,8 +18,12 @@ use crate::cursor::{self, FhCursor};
 use crate::{capture, modules, state};
 
 /// Walk the frame-pointer chain from `start_rbp`, returning the return addresses
-/// `[*(rbp+8), *(*rbp+8), ...]`. x86_64 only.
-#[cfg(target_arch = "x86_64")]
+/// `[*(rbp+8), *(*rbp+8), ...]`. x86_64, and Linux arm64, whose frame records have the same
+/// layout.
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_os = "linux", target_arch = "aarch64")
+))]
 fn fp_chain(mut rbp: u64, max: usize) -> Vec<u64> {
     let mut out = Vec::new();
     for _ in 0..max {
@@ -632,7 +636,10 @@ mod jit_path {
 
 /// A walk from a signal handler running on an alternate stack must continue past the signal
 /// frame into the code the signal interrupted, given both stacks as windows.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod signal_frame {
     use super::*;
     use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -647,8 +654,12 @@ mod signal_frame {
 
     extern "C" fn handler(_sig: libc::c_int, _info: *mut libc::siginfo_t, uc: *mut libc::c_void) {
         // SAFETY: the kernel passes a valid ucontext_t to an SA_SIGINFO handler.
-        let gregs = unsafe { (*(uc as *const libc::ucontext_t)).uc_mcontext.gregs };
-        INTERRUPTED_IP.store(gregs[libc::REG_RIP as usize] as u64, Ordering::Relaxed);
+        let mcontext = unsafe { &(*(uc as *const libc::ucontext_t)).uc_mcontext };
+        #[cfg(target_arch = "x86_64")]
+        let ip = mcontext.gregs[libc::REG_RIP as usize] as u64;
+        #[cfg(target_arch = "aarch64")]
+        let ip = mcontext.pc;
+        INTERRUPTED_IP.store(ip, Ordering::Relaxed);
         let mut ctx = FhContext::zeroed();
         capture::fh_capture_context(&mut ctx);
         let mut cur: FhCursor = unsafe { core::mem::zeroed() };
@@ -682,7 +693,14 @@ mod signal_frame {
     #[inline(never)]
     fn raise_c() {
         let rbp: u64;
-        unsafe { core::arch::asm!("mov {}, rbp", out(reg) rbp) };
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            core::arch::asm!("mov {}, rbp", out(reg) rbp)
+        };
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            core::arch::asm!("mov {}, x29", out(reg) rbp)
+        };
         for (slot, ret) in EXPECTED.iter().zip(fp_chain(rbp, 4)) {
             slot.store(ret, Ordering::Relaxed);
         }
