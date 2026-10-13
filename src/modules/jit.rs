@@ -62,9 +62,9 @@ pub fn register_jit_eh_frame(
     let eh_frame_runtime = eh_frame_ptr as u64;
     // Copy the bytes into owned memory (off the signal path).
     // SAFETY: the caller guarantees [eh_frame_ptr, +len) is readable at call time.
-    let eh_frame_copy: Bytes = unsafe { core::slice::from_raw_parts(eh_frame_ptr, eh_frame_len) }
-        .to_vec()
-        .into_boxed_slice();
+    let eh_frame_copy = Bytes::Owned(Box::from(unsafe {
+        core::slice::from_raw_parts(eh_frame_ptr, eh_frame_len)
+    }));
 
     // Validate that the section parses end-to-end before handing it to framehop:
     // framehop's internal FDE-index build has no error channel back to us, and an

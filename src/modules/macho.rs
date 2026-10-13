@@ -7,10 +7,10 @@
 //! run under dyld's lock, so — unlike the index-based `_dyld_image_count()` /
 //! `_dyld_get_image_header(i)` APIs — the header pointer can never dangle under us.
 //!
-//! For each image we read its `__TEXT` segment + relevant sections (`__unwind_info`,
-//! `__eh_frame`, `__text`, `__stubs`, `__stub_helper`, `__got`), copy them into owned
-//! memory, and build a framehop module. Section bytes live at `section.addr + slide`; the
-//! un-slid `addr` is the SVMA.
+//! For each image we locate its `__TEXT` segment + relevant sections (`__unwind_info`,
+//! `__eh_frame`, `__text`, `__stubs`, `__stub_helper`, `__got`) and build a framehop module
+//! that reads them in place. Section bytes live at `section.addr + slide`; the un-slid
+//! `addr` is the SVMA.
 
 // libc deprecated its Mach-O types in favor of the `mach2` crate; the layouts are
 // ABI-stable, so keep them rather than add a dependency for a few structs.
@@ -93,7 +93,7 @@ extern "C" fn on_remove_image(header: *const libc::mach_header, slide: libc::int
     }
 }
 
-/// First-pass scan: the image's key (`__TEXT` AVMA). Cheap; no copies.
+/// First-pass scan: the image's key (`__TEXT` AVMA). Cheap.
 unsafe fn image_key(header: *const libc::mach_header_64, slide: u64) -> Option<u64> {
     let h = &*header;
     let mut p = (header as *const u8).add(core::mem::size_of::<libc::mach_header_64>());
@@ -153,7 +153,7 @@ unsafe fn build_image(
     // already handles base-address reuse); keep it cheap.
     let fp = text_vmaddr ^ text_vmsize.rotate_left(32);
 
-    // Second pass: copy sections.
+    // Second pass: locate sections.
     let mut p = (header as *const u8).add(core::mem::size_of::<libc::mach_header_64>());
     for _ in 0..ncmds {
         let lc = &*(p as *const libc::load_command);
@@ -164,7 +164,7 @@ unsafe fn build_image(
                 // Compact unwind rules need instruction bytes even for large images:
                 // prologues/epilogues and indirect stack sizes cannot be recovered
                 // reliably from the compact opcode alone.
-                let bytes = copy_mem(
+                let bytes = mapped(
                     (seg.vmaddr.wrapping_add(slide)) as *const u8,
                     seg.vmsize as usize,
                 );
@@ -188,10 +188,10 @@ unsafe fn build_image(
                 match () {
                     _ if sect_name_eq(&sec.sectname, b"__text") => text_svma = Some(svma),
                     _ if sect_name_eq(&sec.sectname, b"__unwind_info") => {
-                        unwind_info = Some(copy_mem(data_ptr, sec.size as usize));
+                        unwind_info = Some(mapped(data_ptr, sec.size as usize));
                     }
                     _ if sect_name_eq(&sec.sectname, b"__eh_frame") => {
-                        eh_frame = Some((copy_mem(data_ptr, sec.size as usize), svma));
+                        eh_frame = Some((mapped(data_ptr, sec.size as usize), svma));
                     }
                     _ if sect_name_eq(&sec.sectname, b"__stubs") => stubs_svma = Some(svma),
                     _ if sect_name_eq(&sec.sectname, b"__stub_helper") => {
@@ -249,10 +249,9 @@ unsafe fn build_image(
     Some((key, fp, Some(module)))
 }
 
-unsafe fn copy_mem(ptr: *const u8, len: usize) -> Bytes {
-    core::slice::from_raw_parts(ptr, len)
-        .to_vec()
-        .into_boxed_slice()
+/// The image bytes at `ptr`, read in place (see `Bytes`).
+unsafe fn mapped(ptr: *const u8, len: usize) -> Bytes {
+    Bytes::Mapped(core::slice::from_raw_parts(ptr, len))
 }
 
 fn seg_name_eq(field: &[libc::c_char; 16], name: &[u8]) -> bool {
@@ -348,8 +347,6 @@ mod tests {
             unsafe { build_image(image.as_ptr().cast::<libc::mach_header_64>(), 0) }.unwrap();
         let mut unw = UnwinderX86_64::new();
         unw.add_module(module.unwrap());
-        // The snapshot must retain its own text copy after the image goes away.
-        drop(image);
         let mut stack = [0u64; 0x180 / 8];
         stack[0x130 / 8] = 0x160;
         stack[0x138 / 8] = 0x12345;

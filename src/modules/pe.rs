@@ -5,8 +5,8 @@
 //! ourselves and return those sections. Modules are enumerated with
 //! `EnumProcessModules` + `GetModuleInformation` (done off any thread-suspend window),
 //! each module is **pinned** (`GetModuleHandleExW`, released with `FreeLibrary`) while
-//! its in-memory PE image is parsed and its unwind sections are copied, so a concurrent
-//! `FreeLibrary` elsewhere cannot unmap the image under us.
+//! its in-memory PE image is parsed, so a concurrent `FreeLibrary` elsewhere cannot unmap
+//! the image under us. The module then reads its sections in place (see `Bytes`).
 //!
 //! Note: Julia's Windows sampler suspends the target thread and unwinds on a *separate*
 //! thread, so the (allocating) PE path here is fine — but enumeration must not run while a
@@ -65,8 +65,8 @@ pub fn enumerate(known: &HashMap<u64, u64>) -> Option<EnumResult> {
 
     for &hmod in &handles {
         // Pin the module (loader refcount) before touching its image: the enumerated
-        // handles are unpinned, so a concurrent FreeLibrary could unmap the image under
-        // our section copies. Vanished-before-pin modules are skipped (== unloaded).
+        // handles are unpinned, so a concurrent FreeLibrary could unmap the image while we
+        // parse it. Vanished-before-pin modules are skipped (== unloaded).
         let mut pinned: HMODULE = core::ptr::null_mut();
         let ok = unsafe {
             GetModuleHandleExW(
@@ -160,15 +160,14 @@ unsafe fn build_pe_module(base: u64, size: u64) -> Option<Module<Bytes>> {
                 let rva = read_u32(base_ptr, sh_off + 12);
                 // In the loaded image only the section's *virtual* extent is guaranteed
                 // mapped; SizeOfRawData is a file-alignment quantity that may legally
-                // exceed it, so copying max(virtual, raw) could read past the mapping.
+                // exceed it, so using max(virtual, raw) could read past the mapping.
                 // Clamp to the image extent for the (also legal) rva+size > SizeOfImage.
                 let len = (virtual_size as u64).min(size.saturating_sub(rva as u64)) as usize;
                 if len == 0 {
                     return None;
                 }
-                let bytes = core::slice::from_raw_parts(base_ptr.add(rva as usize), len)
-                    .to_vec()
-                    .into_boxed_slice();
+                let bytes =
+                    Bytes::Mapped(core::slice::from_raw_parts(base_ptr.add(rva as usize), len));
                 return Some((rva, bytes));
             }
         }

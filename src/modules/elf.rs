@@ -1,8 +1,8 @@
 //! Linux / FreeBSD static-module enumeration via `dl_iterate_phdr`.
 //!
 //! For each loaded ELF object we locate the in-memory `.eh_frame_hdr`
-//! (`PT_GNU_EH_FRAME`), decode it to find `.eh_frame`, copy both sections into owned
-//! memory, and build a framehop `EhFrameHdrAndEhFrame` module. ELF SVMA == AVMA - bias,
+//! (`PT_GNU_EH_FRAME`), decode it to find `.eh_frame`, and build a framehop
+//! `EhFrameHdrAndEhFrame` module that reads both sections in place. ELF SVMA == AVMA - bias,
 //! so `base_svma = 0` and `base_avma = dlpi_addr`.
 
 use std::collections::HashMap;
@@ -18,7 +18,7 @@ const PT_LOAD: u32 = 1;
 const PT_GNU_EH_FRAME: u32 = 0x6474_e550;
 const PF_X: u32 = 1;
 
-/// A module's copied unwind sections + geometry, captured under the dl lock.
+/// A module's unwind sections + geometry, captured under the dl lock.
 struct RawSpec {
     key: u64,
     name: String,
@@ -141,7 +141,7 @@ extern "C" fn callback(
     let fp = super::fingerprint_of(&[hdr_vaddr, hdr_memsz, avma_hi - avma_lo], name_bytes);
     collector.current.insert(key, fp);
 
-    // Only build (and copy bytes for) modules we don't already know about (same key AND
+    // Only build modules we don't already know about (same key AND
     // same fingerprint; a changed fingerprint means the base address was reused).
     if collector.known.get(&key) == Some(&fp) {
         return 0;
@@ -172,15 +172,12 @@ extern "C" fn callback(
     };
     let eh_frame_len = (eh_frame_end - eh_frame_avma) as usize;
 
-    // Copy both sections (under the dl lock, so no concurrent dlclose).
-    let eh_frame_hdr: Bytes =
-        unsafe { core::slice::from_raw_parts(hdr_avma as *const u8, hdr_len) }
-            .to_vec()
-            .into_boxed_slice();
-    let eh_frame: Bytes =
-        unsafe { core::slice::from_raw_parts(eh_frame_avma as *const u8, eh_frame_len) }
-            .to_vec()
-            .into_boxed_slice();
+    // SAFETY: both sections are mapped for as long as the object is loaded (see `Bytes`).
+    let eh_frame_hdr =
+        Bytes::Mapped(unsafe { core::slice::from_raw_parts(hdr_avma as *const u8, hdr_len) });
+    let eh_frame = Bytes::Mapped(unsafe {
+        core::slice::from_raw_parts(eh_frame_avma as *const u8, eh_frame_len)
+    });
 
     let name = if info.dlpi_name.is_null() || unsafe { *info.dlpi_name } == 0 {
         String::from("<main>")
