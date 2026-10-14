@@ -28,6 +28,8 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - name: C smoke test (public header + cdylib through the real C ABI)
         run: sh tests/run_c_smoke.sh
+      - name: Stale-module test (a walk through code mapped into an unloaded object's range)
+        run: sh tests/run_c_stale_module.sh
 
   # The declared rust-version must actually build the crate.
   msrv:
