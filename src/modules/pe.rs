@@ -2,24 +2,36 @@
 //!
 //! `ExplicitModuleSectionInfo` cannot produce a framehop PE module (it has no
 //! `.pdata`/`.xdata`/`.rdata` arm), so we implement [`framehop::ModuleSectionInfo`]
-//! ourselves and return those sections. Modules are enumerated with
-//! `EnumProcessModules` + `GetModuleInformation` (done off any thread-suspend window).
-//! While the enumeration parses an image and copies its unwind sections, it pins the
-//! module (`GetModuleHandleExW`, released with `FreeLibrary`), so a concurrent
-//! `FreeLibrary` cannot unmap the image. `.text` is read in place, and only for the first
-//! frame of a walk (see `Bytes`).
+//! ourselves and return those sections. Init enumerates modules once with
+//! `EnumProcessModules` + `GetModuleInformation`. After that, the DLL notifications
+//! (`LdrRegisterDllNotification`) keep the set current. The loaded notification runs after
+//! the image is mapped and snapped, before its `DllMain`. The unloaded notification runs
+//! before the image is unmapped. Thus the set is exact, and sections are read in place (see
+//! `Bytes`). The initial enumeration pins each module (`GetModuleHandleExW`, released
+//! with `FreeLibrary`) while it parses the image, so a concurrent `FreeLibrary` cannot
+//! unmap it.
+//!
+//! The notification callback runs with the loader busy: every `LoadLibrary`, `FreeLibrary`
+//! and thread creation in the process waits until it returns. `GetModuleHandleExW`,
+//! `EnumProcessModules`, the heap and SRW locks do not wait. The callback allocates and
+//! takes the registry and writer locks. This is safe because code that holds those locks
+//! never waits on the loader (see the lock order in `modules/mod.rs`). `FreeLibrary` waits
+//! on the loader, so the enumeration releases its pin before it takes the registry lock.
 //!
 //! Note: Julia's Windows sampler suspends the target thread and unwinds on a *separate*
 //! thread, so the (allocating) PE path here is fine — but enumeration must not run while a
 //! target is suspended (loader-lock hazard).
 
+use core::ffi::c_void;
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Mutex;
 
 use framehop::{Module, ModuleSectionInfo};
 use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
 use windows_sys::Win32::System::LibraryLoader::{
-    GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+    GetModuleHandleA, GetModuleHandleExW, GetProcAddress, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
 };
 use windows_sys::Win32::System::ProcessStatus::{
     EnumProcessModules, GetModuleInformation, MODULEINFO,
@@ -93,10 +105,7 @@ pub fn enumerate(known: &HashMap<u64, u64>) -> Option<EnumResult> {
             let base = info.lpBaseOfDll as u64;
             let size = info.SizeOfImage as u64;
             let key = base;
-            // Size alone can't tell two DLLs apart across base-address reuse; the PE
-            // link timestamp almost always can.
-            let timestamp = unsafe { pe_timestamp(base) } as u64;
-            let fp = super::fingerprint_of(&[size, timestamp], b"");
+            let fp = unsafe { fingerprint(base, size) };
             current.insert(key, fp);
             if known.get(&key) != Some(&fp) {
                 if let Some(module) = unsafe { build_pe_module(base, size) } {
@@ -111,6 +120,143 @@ pub fn enumerate(known: &HashMap<u64, u64>) -> Option<EnumResult> {
         current,
         new_modules,
     })
+}
+
+/// Fingerprint of the image at `base`. Size alone cannot tell two DLLs apart across
+/// base-address reuse. The PE link timestamp almost always can.
+///
+/// # Safety
+/// `base` must be the base of a mapped PE image that stays mapped for the call.
+unsafe fn fingerprint(base: u64, size: u64) -> u64 {
+    let timestamp = pe_timestamp(base) as u64;
+    super::fingerprint_of(&[size, timestamp], b"")
+}
+
+// ---------------------------------------------------------------------------
+// DLL notifications. ntdll exports these but no import library or windows-sys binding
+// covers them, so they are resolved by name.
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+struct UnicodeString {
+    length: u16,
+    maximum_length: u16,
+    buffer: *const u16,
+}
+
+/// `LDR_DLL_LOADED_NOTIFICATION_DATA` and `LDR_DLL_UNLOADED_NOTIFICATION_DATA` have the
+/// same layout.
+#[repr(C)]
+struct NotificationData {
+    flags: u32,
+    full_dll_name: *const UnicodeString,
+    base_dll_name: *const UnicodeString,
+    dll_base: *mut c_void,
+    size_of_image: u32,
+}
+
+const LDR_DLL_NOTIFICATION_REASON_LOADED: u32 = 1;
+const LDR_DLL_NOTIFICATION_REASON_UNLOADED: u32 = 2;
+
+type NotificationFn =
+    unsafe extern "system" fn(reason: u32, data: *const NotificationData, context: *const c_void);
+type RegisterFn = unsafe extern "system" fn(
+    flags: u32,
+    function: NotificationFn,
+    context: *const c_void,
+    cookie: *mut *mut c_void,
+) -> i32;
+type UnregisterFn = unsafe extern "system" fn(cookie: *mut c_void) -> i32;
+
+/// The registration cookie, null when not registered.
+static COOKIE: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
+/// True while notifications keep the module set current, so `refresh` can return early.
+static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Serializes registration and unregistration.
+static REGISTRATION: Mutex<()> = Mutex::new(());
+
+unsafe fn ntdll_fn(name: &core::ffi::CStr) -> Option<*const c_void> {
+    let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+    if ntdll.is_null() {
+        return None;
+    }
+    GetProcAddress(ntdll, name.as_ptr().cast()).map(|f| f as *const c_void)
+}
+
+/// Register for DLL load and unload notifications. Idempotent. Returns whether
+/// notifications are active afterwards. Off the signal path.
+pub fn register_notifications() -> bool {
+    let _guard = REGISTRATION.lock().unwrap_or_else(|e| e.into_inner());
+    if !COOKIE.load(Ordering::Acquire).is_null() {
+        return true;
+    }
+    // SAFETY: resolving and calling documented ntdll exports with the documented
+    // signatures; the callback is a process-lifetime `extern "system"` function.
+    unsafe {
+        let Some(register) = ntdll_fn(c"LdrRegisterDllNotification") else {
+            return false;
+        };
+        let register: RegisterFn = core::mem::transmute(register);
+        let mut cookie: *mut c_void = core::ptr::null_mut();
+        if register(0, on_notification, core::ptr::null(), &mut cookie) != 0 || cookie.is_null() {
+            return false;
+        }
+        COOKIE.store(cookie, Ordering::Release);
+    }
+    ACTIVE.store(true, Ordering::Release);
+    true
+}
+
+/// Unregister the notifications, so that no callback runs after this (see `super::fini`).
+/// Idempotent. Off the signal path.
+pub fn unregister_notifications() {
+    let _guard = REGISTRATION.lock().unwrap_or_else(|e| e.into_inner());
+    let cookie = COOKIE.swap(core::ptr::null_mut(), Ordering::AcqRel);
+    if cookie.is_null() {
+        return;
+    }
+    ACTIVE.store(false, Ordering::Release);
+    // SAFETY: `cookie` came from a successful registration above.
+    unsafe {
+        if let Some(unregister) = ntdll_fn(c"LdrUnregisterDllNotification") {
+            let unregister: UnregisterFn = core::mem::transmute(unregister);
+            unregister(cookie);
+        }
+    }
+}
+
+/// True while the loader's notifications keep the module set current.
+pub fn notifications_active() -> bool {
+    ACTIVE.load(Ordering::Acquire)
+}
+
+/// The notification callback. Runs on the loading or unloading thread with the loader busy
+/// (see the module docs). It must never call the loader.
+unsafe extern "system" fn on_notification(
+    reason: u32,
+    data: *const NotificationData,
+    _context: *const c_void,
+) {
+    if data.is_null() {
+        return;
+    }
+    // SAFETY: the loader passes a valid structure for the duration of the call.
+    let d = &*data;
+    let base = d.dll_base as u64;
+    let size = d.size_of_image as u64;
+    if base == 0 || size == 0 {
+        return;
+    }
+    match reason {
+        LDR_DLL_NOTIFICATION_REASON_LOADED => {
+            // The image is mapped and the loader holds it until the callback returns.
+            let fp = fingerprint(base, size);
+            let module = build_pe_module(base, size);
+            super::image_added(base, fp, module);
+        }
+        LDR_DLL_NOTIFICATION_REASON_UNLOADED => super::image_removed(base),
+        _ => {}
+    }
 }
 
 /// Read IMAGE_FILE_HEADER.TimeDateStamp from the loaded image at `base` (0 if the
@@ -151,7 +297,7 @@ unsafe fn build_pe_module(base: u64, size: u64) -> Option<Module<Bytes>> {
 
     // Read section-header fields through copy helpers (the in-memory image is only
     // guaranteed byte-aligned, so we never form a reference to the packed struct).
-    let sec = |want: &[u8], copy: bool| -> Option<(u32, Bytes)> {
+    let sec = |want: &[u8]| -> Option<(u32, Bytes)> {
         for i in 0..num_sections {
             let sh_off = section_table + i * SECTION_HEADER_SIZE;
             let mut name = [0u8; 8];
@@ -167,22 +313,18 @@ unsafe fn build_pe_module(base: u64, size: u64) -> Option<Module<Bytes>> {
                 if len == 0 {
                     return None;
                 }
-                let bytes = core::slice::from_raw_parts(base_ptr.add(rva as usize), len);
-                let bytes = if copy {
-                    Bytes::copy_of(bytes)
-                } else {
-                    Bytes::Mapped(bytes)
-                };
+                let bytes =
+                    Bytes::Mapped(core::slice::from_raw_parts(base_ptr.add(rva as usize), len));
                 return Some((rva, bytes));
             }
         }
         None
     };
 
-    let pdata = sec(b".pdata", true)?; // no .pdata => not framehop-unwindable here
-    let xdata = sec(b".xdata", true);
-    let rdata = sec(b".rdata", true); // MSVC places unwind info in .rdata
-    let text = sec(b".text", false);
+    let pdata = sec(b".pdata")?; // no .pdata => not framehop-unwindable here
+    let xdata = sec(b".xdata");
+    let rdata = sec(b".rdata"); // MSVC places unwind info in .rdata
+    let text = sec(b".text");
 
     let info = PeSectionInfo {
         base_svma: base,
