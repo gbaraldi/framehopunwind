@@ -34,16 +34,16 @@ use framehop::{
 ///
 /// `Mapped` bytes are read in place and are valid only while their object stays mapped.
 /// They are safe where a synchronous unload callback removes the module from the published
-/// set before the loader unmaps it (dyld remove-image on macOS). A walk that holds an older
-/// snapshot never looks the module up, because no live frame can be inside an object that
-/// is being unloaded.
+/// set before the loader unmaps it (dyld remove-image on macOS, DLL notifications on
+/// Windows). A walk that holds an older snapshot never looks the module up, because no live
+/// frame can be inside an object that is being unloaded.
 ///
-/// `Owned` bytes are copies. ELF and Windows have no unload callback here, so a module can
-/// stay in the set after its object is unloaded. If the loader reuses that address range, a
-/// walk through live code there looks the stale module up. Thus unwind tables are copies
-/// there: a copy gives wrong frames until the next refresh, but mapped bytes give reads of
-/// freed memory. JIT `.eh_frame` is copied so that the embedder can free its buffer after
-/// it deregisters the module.
+/// `Owned` bytes are copies. Linux and FreeBSD have no unload callback, so a module can stay
+/// in the set after its object is unloaded. If the loader reuses that address range, a walk
+/// through live code there looks the stale module up. Thus ELF unwind tables are copies: a
+/// copy gives wrong frames until the next refresh, but mapped bytes give reads of freed
+/// memory. JIT `.eh_frame` is copied so that the embedder can free its buffer after it
+/// deregisters the module.
 ///
 /// Code bytes are `Mapped` everywhere. framehop analyzes Mach-O prologues and epilogues and
 /// PE epilogues only for the first frame of a walk, and a first frame is code that the

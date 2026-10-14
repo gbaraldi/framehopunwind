@@ -33,7 +33,7 @@
  * embedder's, e.g. Julia's).
  *
  * Module lifetime. A walk unwinds with the set of loaded objects as it was at the last
- * fh_modules_refresh. On macOS, the loader instead keeps the set current, so
+ * fh_modules_refresh. On macOS and Windows, the loader instead keeps the set current, so
  * fh_modules_refresh has no effect after fh_init. A walk without a preceding refresh is
  * still safe. Frames in objects loaded since the last refresh are unwound by frame pointer.
  * A stale module can give incorrect frames in the former address range of its object, but
@@ -134,8 +134,13 @@ void fh_thread_register(void);
 
 /* Re-scan loaded modules. A walk uses the set of loaded objects as of the last call. Call
  * before walks that can cross objects loaded or unloaded since the last call. JIT modules
- * are unaffected. On macOS this call has no effect after fh_init. */
+ * are unaffected. On macOS and Windows this call has no effect after fh_init. */
 void fh_modules_refresh(void);
+
+/* Unregisters the loader callbacks of this library. Must be called once before process
+ * exit or before this library is unloaded, after profiling stops. On platforms other than
+ * Windows this call has no effect. */
+void fh_fini(void);
 
 /* Diagnostics: number of JIT modules currently registered, and the cumulative count of
  * failed JIT registrations (bad arguments or unparsable .eh_frame — such code falls back
