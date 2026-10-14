@@ -32,12 +32,44 @@
  * fault. This crate does NOT install its own SIGSEGV handler (it would conflict with the
  * embedder's, e.g. Julia's).
  *
+ * ---------------------------------------------------------------------------
+ * Concurrency contract
+ * ---------------------------------------------------------------------------
+ * Definitions. The read path is fh_capture_context, fh_context_from_ucontext,
+ * fh_cursor_init*, fh_step, fh_get_reg and fh_cursor_fini. The mutating path is every other
+ * entry point, plus the loader callbacks that this library installs on macOS and Windows. A
+ * suspending thread has suspended another thread and has not yet resumed it.
+ *
+ * Guarantees.
+ *   1. The read path acquires nothing: no lock, heap allocation, loader call, thread
+ *      creation, or first touch of thread-local storage. It terminates on its own and is
+ *      async-signal-safe.
+ *   2. A writer never blocks a reader or makes it lose a sample. A reader never blocks a
+ *      writer.
+ *
+ * Obligations on the embedder.
+ *   3. A suspending thread must call only the read path until it resumes its target. The
+ *      target can hold any lock in the process, including the heap lock, the loader lock,
+ *      and this library's locks. The read path waits on none of them (guarantee 1). But
+ *      fh_modules_refresh, JIT registration, and any call that allocates or loads a library
+ *      can wait on the target forever. This applies to every path that suspends a thread to
+ *      walk it, not only the profiler.
+ *   4. The embedder must not call the mutating path from a signal handler. It can call that
+ *      path while the loader lock is held, for example from a library constructor.
+ *   5. Where this library installs loader callbacks (Windows), the embedder must call
+ *      fh_fini once before process exit or before it unloads this library, after profiling
+ *      stops. Otherwise, a loader notification during process teardown can hang, and one
+ *      after the unload can call into unmapped code.
+ *
  * Module lifetime. A walk unwinds with the set of loaded objects as it was at the last
  * fh_modules_refresh. On macOS and Windows, the loader instead keeps the set current, so
- * fh_modules_refresh has no effect after fh_init. A walk without a preceding refresh is
- * still safe. Frames in objects loaded since the last refresh are unwound by frame pointer.
- * A stale module can give incorrect frames in the former address range of its object, but
- * never causes a read of unmapped memory. Instruction bytes are read in place.
+ * fh_modules_refresh has no effect after fh_init. Call fh_modules_refresh before walks that
+ * can cross objects loaded or unloaded since the last call, from a context where the
+ * mutating path is permitted (obligations 3 and 4). It does not affect JIT modules. A walk
+ * without a preceding refresh is still safe. Frames in objects loaded since the last refresh
+ * are unwound by frame pointer. A stale module can give incorrect frames in the former
+ * address range of its object, but never causes a read of unmapped memory. Instruction
+ * bytes are read in place.
  *
  * Surviving a faulting read by longjmp-ing out of fh_step (Julia's jl_set_safe_restore)
  * crosses this library's Rust frames — defined behavior only while they hold no pending
@@ -133,13 +165,14 @@ int fh_init(size_t num_slots);
 void fh_thread_register(void);
 
 /* Re-scan loaded modules. A walk uses the set of loaded objects as of the last call. Call
- * before walks that can cross objects loaded or unloaded since the last call. JIT modules
- * are unaffected. On macOS and Windows this call has no effect after fh_init. */
+ * before walks that can cross objects loaded or unloaded since the last call, where the
+ * mutating path is permitted (obligations 3 and 4). JIT modules are unaffected. On macOS
+ * and Windows this call has no effect after fh_init. */
 void fh_modules_refresh(void);
 
 /* Unregisters the loader callbacks of this library. Must be called once before process
- * exit or before this library is unloaded, after profiling stops. On platforms other than
- * Windows this call has no effect. */
+ * exit or before this library is unloaded, after profiling stops (obligation 5). On
+ * platforms other than Windows this call has no effect. */
 void fh_fini(void);
 
 /* Diagnostics: number of JIT modules currently registered, and the cumulative count of
