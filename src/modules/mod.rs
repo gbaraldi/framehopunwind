@@ -11,15 +11,16 @@
 //! [`init`]), which run synchronously under dyld's lock on every load and unload —
 //! including a replay for already-loaded images at installation time. This avoids the
 //! index-based `_dyld_image_count()` / `_dyld_get_image_header(i)` APIs, which can race
-//! with a concurrent unload (the header pointer dangles). On ELF/Windows the set is
-//! re-derived by [`refresh`].
+//! with a concurrent unload (the header pointer dangles). On Windows, [`init`] enumerates
+//! the set once, and the DLL notifications then maintain it. ELF has no unload callback, so
+//! [`refresh`] re-derives the set, and unwind tables are copies (see `Bytes`).
 //!
 //! Lock order is always loader -> REGISTRY -> WRITER, on every platform. The loader
-//! callbacks (dyld's on macOS) take REGISTRY under the loader lock. Thus code that holds
-//! REGISTRY or WRITER must not wait on the loader: no `dlopen`, `dlclose`,
-//! `dl_iterate_phdr`, `LoadLibrary`, `FreeLibrary` or thread creation under either lock.
-//! For this reason, `refresh` enumerates before it takes REGISTRY, and applies the result
-//! under it. The signal path takes neither lock.
+//! callbacks (dyld on macOS, DLL notifications on Windows) take REGISTRY under the loader
+//! lock. Thus code that holds REGISTRY or WRITER must not wait on the loader: no `dlopen`,
+//! `dlclose`, `dl_iterate_phdr`, `LoadLibrary`, `FreeLibrary` or thread creation under
+//! either lock. For this reason, `refresh` enumerates before it takes REGISTRY, and applies
+//! the result under it. The signal path takes neither lock.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
@@ -64,7 +65,7 @@ struct Registry {
     /// ELF: the loader's load/unload counts at the last scan; see `elf::load_counts`.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     load_counts: Option<(u64, u64)>,
-    /// Bumped on every change to `static_mods`, so that `refresh` can find a stale enumeration.
+    /// Bumped on every change to `static_mods`, so that `scan` can find a stale enumeration.
     static_seq: u64,
     /// macOS: add-image events recorded during the initial dyld callback replay, published
     /// in one batch by `macos_end_batch` (one snapshot instead of one per preloaded image).
@@ -94,24 +95,50 @@ fn registry() -> std::sync::MutexGuard<'static, Registry> {
     REGISTRY.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Bring up static-module tracking: install the dyld callbacks on macOS (which replays
-/// all already-loaded images), or do an initial scan elsewhere. Idempotent.
+/// Bring up static-module tracking. Idempotent. On macOS, the dyld callbacks replay all
+/// already-loaded images when they are installed.
 pub fn init() {
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     crate::sigreturn::init();
     #[cfg(target_os = "macos")]
     macho::init_callbacks();
+    // Register before the scan, so that no load or unload is missed. The fingerprint
+    // reconciles an image that both report. A notification during the scan makes it re-run.
+    // Initialize the registry first, so that the callback never runs its first-use setup.
+    #[cfg(windows)]
+    {
+        drop(registry());
+        pe::register_notifications();
+    }
     #[cfg(not(target_os = "macos"))]
-    refresh();
+    scan();
 }
 
-/// Re-scan loaded modules and publish a snapshot with additions, removals, and changed
-/// images (same base, different fingerprint). JIT modules are preserved. A failed
-/// enumeration keeps the previous snapshot: an empty result must not read as "everything
-/// unloaded". If the static set changed during the enumeration, the result can be stale,
-/// so the enumeration runs again. Off the signal path.
+/// Unregister the Windows DLL notifications, so that no callback runs during process
+/// teardown. A thread that `ExitProcess` killed can still own the registry lock there.
+/// Off the signal path.
+pub fn fini() {
+    #[cfg(windows)]
+    pe::unregister_notifications();
+}
+
+/// Re-scan loaded modules (`fh_modules_refresh`). Off the signal path.
 #[cfg(not(target_os = "macos"))]
 pub fn refresh() {
+    #[cfg(windows)]
+    if pe::notifications_active() {
+        return;
+    }
+    scan();
+}
+
+/// Enumerate the loaded modules and publish a snapshot with additions, removals, and
+/// changed images (same base, different fingerprint). JIT modules are preserved. A failed
+/// enumeration keeps the previous snapshot: an empty result must not read as "everything
+/// unloaded". If the static set changed during the enumeration, the result can be stale,
+/// so the enumeration runs again.
+#[cfg(not(target_os = "macos"))]
+fn scan() {
     // Equal counts mean no object was loaded or unloaded since the last scan. Read them
     // before scanning, so a load during the scan is picked up by the next refresh.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -224,7 +251,9 @@ fn enumerate_static(known: &HashMap<u64, u64>) -> Option<EnumResult> {
 }
 
 // ---------------------------------------------------------------------------
-// macOS dyld-callback plumbing (called from macho.rs under dyld's lock).
+// Loader-callback plumbing: dyld's add/remove-image callbacks (macho.rs, under dyld's
+// lock) and Windows' DLL notifications (pe.rs, with the loader busy). Both publish
+// synchronously and never wait for a reader.
 // ---------------------------------------------------------------------------
 
 /// Begin batching add-image events (used around the initial dyld callback replay).
@@ -253,30 +282,40 @@ pub(crate) fn macos_end_batch() {
     });
 }
 
-/// Record one loaded image (dyld add-image callback, or the installation replay).
-#[cfg(target_os = "macos")]
-pub(crate) fn macos_add_image(key: u64, fp: u64, module: Module<Bytes>) {
+/// Record one loaded image (dyld add-image callback or its installation replay; Windows
+/// loaded notification). `module` is `None` for an image without unwind info, which is
+/// still tracked so its unload and any base-address reuse are seen.
+#[cfg(any(target_os = "macos", windows))]
+pub(crate) fn image_added(key: u64, fp: u64, module: Option<Module<Bytes>>) {
     let mut reg = registry();
+    #[cfg(target_os = "macos")]
     if reg.batching {
-        reg.pending.push((key, fp, module));
+        if let Some(module) = module {
+            reg.pending.push((key, fp, module));
+        }
         return;
     }
     let replace = reg.static_mods.contains_key(&key);
-    state::with_writer(|unw| {
-        if replace {
-            unw.remove_module(key);
-        }
-        unw.add_module(module);
-    });
+    if replace || module.is_some() {
+        state::with_writer(|unw| {
+            if replace {
+                unw.remove_module(key);
+            }
+            if let Some(module) = module {
+                unw.add_module(module);
+            }
+        });
+    }
     reg.static_mods.insert(key, fp);
     reg.static_seq += 1;
 }
 
-/// Drop one unloading image (dyld remove-image callback). The image is still mapped. See
-/// `Bytes` for why a walk on an older snapshot stays safe.
-#[cfg(target_os = "macos")]
-pub(crate) fn macos_remove_image(key: u64) {
+/// Drop one unloading image (dyld remove-image callback, Windows unloaded notification).
+/// The image is still mapped. See `Bytes` for why a walk on an older snapshot stays safe.
+#[cfg(any(target_os = "macos", windows))]
+pub(crate) fn image_removed(key: u64) {
     let mut reg = registry();
+    #[cfg(target_os = "macos")]
     if reg.batching {
         reg.pending.retain(|(k, _, _)| *k != key);
     }
