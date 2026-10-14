@@ -35,7 +35,26 @@ The one bounded resource is the cursor **slot pool**. It starts at `fh_init(num_
 2. call `fh_thread_register` once on every thread that will **run** the unwinder (including sampler/listener threads), off the signal/suspend path — it also pre-faults this library's thread-local storage, whose first access can otherwise allocate (dyld lazy TLV on macOS, `__tls_get_addr` on ELF) at exactly the wrong moment;
 3. always run `fh_cursor_fini` for each successful `fh_cursor_init`, **including on fault recovery** — if a SIGSEGV-recovery `longjmp` skips `fh_cursor_fini`, that slot leaks and the pool eventually drains. Julia is safe here because `jl_set_safe_restore`'s `setjmp` is local to `jl_unw_stepn`, so a caught fault still returns to the caller that runs `fh_cursor_fini`. Note also that such a `longjmp` crosses this library's Rust frames, which is defined behavior only while those frames hold no pending destructors — the read path is written allocation- and destructor-free to keep that true, but exact bounds (which avoid the fault entirely) are the *supported* configuration and the `longjmp` path is best-effort.
 
-A walk unwinds with the set of loaded objects as it was at the last `fh_modules_refresh`. On macOS and Windows, the loader instead keeps the set current, so `fh_modules_refresh` has no effect after `fh_init`. If Windows does not accept this library's DLL notifications, `fh_modules_refresh` works as on Linux. A walk without a preceding refresh is still safe. Frames in objects loaded since the last refresh are unwound by frame pointer. A stale module can give incorrect frames in the former address range of its object, but never causes a read of unmapped memory. Instruction bytes are read in place.
+## Concurrency contract
+
+### Definitions
+
+The *read path* is `fh_capture_context`, `fh_context_from_ucontext`, `fh_cursor_init*`, `fh_step`, `fh_get_reg` and `fh_cursor_fini`. The *mutating path* is every other entry point, plus the loader callbacks that this library installs on macOS and Windows. A *suspending thread* has suspended another thread and has not yet resumed it.
+
+### Guarantees
+
+1. The read path acquires nothing: no lock, heap allocation, loader call, thread creation, or first touch of thread-local storage. It terminates on its own and is async-signal-safe.
+2. A writer never blocks a reader or makes it lose a sample. A reader never blocks a writer.
+
+### Obligations on the embedder
+
+3. A suspending thread must call only the read path until it resumes its target. The target can hold any lock in the process, including the heap lock, the loader lock, and this library's locks. The read path waits on none of them (guarantee 1). But `fh_modules_refresh`, JIT registration, and any call that allocates or loads a library can wait on the target forever. This applies to every path that suspends a thread to walk it, not only the profiler.
+4. The embedder must not call the mutating path from a signal handler. It can call that path while the loader lock is held, for example from a library constructor.
+5. Where this library installs loader callbacks (Windows), the embedder must call `fh_fini` once before process exit or before it unloads this library, after profiling stops. Otherwise, a loader notification during process teardown can hang, and one after the unload can call into unmapped code.
+
+### Module lifetime
+
+A walk unwinds with the set of loaded objects as it was at the last `fh_modules_refresh`. On macOS and Windows, the loader instead keeps the set current, so `fh_modules_refresh` has no effect after `fh_init`. If Windows does not accept this library's DLL notifications, `fh_modules_refresh` works as on Linux. Call `fh_modules_refresh` before walks that can cross objects loaded or unloaded since the last call, from a context where the mutating path is permitted (obligations 3 and 4). It does not affect JIT modules. A walk without a preceding refresh is still safe. Frames in objects loaded since the last refresh are unwound by frame pointer. A stale module can give incorrect frames in the former address range of its object, but never causes a read of unmapped memory. Instruction bytes are read in place.
 
 See the header for the full contract.
 
