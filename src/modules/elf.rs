@@ -1,8 +1,8 @@
 //! Linux / FreeBSD static-module enumeration via `dl_iterate_phdr`.
 //!
 //! For each loaded ELF object we locate the in-memory `.eh_frame_hdr`
-//! (`PT_GNU_EH_FRAME`), decode it to find `.eh_frame`, and build a framehop
-//! `EhFrameHdrAndEhFrame` module that reads both sections in place. ELF SVMA == AVMA - bias,
+//! (`PT_GNU_EH_FRAME`), decode it to find `.eh_frame`, copy both sections (see `Bytes`),
+//! and build a framehop `EhFrameHdrAndEhFrame` module. ELF SVMA == AVMA - bias,
 //! so `base_svma = 0` and `base_avma = dlpi_addr`.
 
 use std::collections::HashMap;
@@ -172,10 +172,11 @@ extern "C" fn callback(
     };
     let eh_frame_len = (eh_frame_end - eh_frame_avma) as usize;
 
-    // SAFETY: both sections are mapped for as long as the object is loaded (see `Bytes`).
+    // SAFETY: both are mapped, and dl_iterate_phdr holds the loader lock, so the object
+    // cannot be unloaded during the copy.
     let eh_frame_hdr =
-        Bytes::Mapped(unsafe { core::slice::from_raw_parts(hdr_avma as *const u8, hdr_len) });
-    let eh_frame = Bytes::Mapped(unsafe {
+        Bytes::copy_of(unsafe { core::slice::from_raw_parts(hdr_avma as *const u8, hdr_len) });
+    let eh_frame = Bytes::copy_of(unsafe {
         core::slice::from_raw_parts(eh_frame_avma as *const u8, eh_frame_len)
     });
 
