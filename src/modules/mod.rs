@@ -14,8 +14,12 @@
 //! with a concurrent unload (the header pointer dangles). On ELF/Windows the set is
 //! re-derived by [`refresh`].
 //!
-//! Lock order is always REGISTRY -> WRITER (never the reverse); neither is ever taken on
-//! the signal path.
+//! Lock order is always loader -> REGISTRY -> WRITER, on every platform. The loader
+//! callbacks (dyld's on macOS) take REGISTRY under the loader lock. Thus code that holds
+//! REGISTRY or WRITER must not wait on the loader: no `dlopen`, `dlclose`,
+//! `dl_iterate_phdr`, `LoadLibrary`, `FreeLibrary` or thread creation under either lock.
+//! For this reason, `refresh` enumerates before it takes REGISTRY, and applies the result
+//! under it. The signal path takes neither lock.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
@@ -60,6 +64,8 @@ struct Registry {
     /// ELF: the loader's load/unload counts at the last scan; see `elf::load_counts`.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     load_counts: Option<(u64, u64)>,
+    /// Bumped on every change to `static_mods`, so that `refresh` can find a stale enumeration.
+    static_seq: u64,
     /// macOS: add-image events recorded during the initial dyld callback replay, published
     /// in one batch by `macos_end_batch` (one snapshot instead of one per preloaded image).
     #[cfg(target_os = "macos")]
@@ -76,6 +82,7 @@ static REGISTRY: LazyLock<Mutex<Registry>> = LazyLock::new(|| {
         jit_eh_frame_by_key: HashMap::new(),
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         load_counts: None,
+        static_seq: 0,
         #[cfg(target_os = "macos")]
         batching: false,
         #[cfg(target_os = "macos")]
@@ -98,27 +105,49 @@ pub fn init() {
     refresh();
 }
 
-/// Re-scan loaded modules and publish a snapshot reflecting additions, removals, and
-/// changed images (same base, different fingerprint). JIT modules are preserved; a
-/// failed enumeration keeps the previous snapshot (an empty result must not read as
-/// "everything unloaded"). Off the signal path.
+/// Re-scan loaded modules and publish a snapshot with additions, removals, and changed
+/// images (same base, different fingerprint). JIT modules are preserved. A failed
+/// enumeration keeps the previous snapshot: an empty result must not read as "everything
+/// unloaded". If the static set changed during the enumeration, the result can be stale,
+/// so the enumeration runs again. Off the signal path.
 #[cfg(not(target_os = "macos"))]
 pub fn refresh() {
-    let mut reg = registry();
     // Equal counts mean no object was loaded or unloaded since the last scan. Read them
     // before scanning, so a load during the scan is picked up by the next refresh.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     let counts = {
         let counts = elf::load_counts();
-        if counts.is_some() && counts == reg.load_counts {
+        if counts.is_some() && counts == registry().load_counts {
             return;
         }
         counts
     };
-    let res = match enumerate_static(&reg.static_mods) {
-        Some(r) => r,
-        None => return, // enumeration failed; keep the current snapshot
-    };
+    for _attempt in 0..8 {
+        let (known, seq) = {
+            let reg = registry();
+            (reg.static_mods.clone(), reg.static_seq)
+        };
+        let res = match enumerate_static(&known) {
+            Some(r) => r,
+            None => return,
+        };
+        let mut reg = registry();
+        if reg.static_seq != seq {
+            continue; // a callback or another scan changed the set
+        }
+        apply_scan(&mut reg, res);
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        {
+            reg.load_counts = counts;
+        }
+        return;
+    }
+    // The set kept changing. Whoever made the last change published it.
+}
+
+/// Apply one enumeration under REGISTRY.
+#[cfg(not(target_os = "macos"))]
+fn apply_scan(reg: &mut Registry, res: EnumResult) {
     let EnumResult {
         current,
         new_modules,
@@ -140,10 +169,6 @@ pub fn refresh() {
         .map(|(k, _)| *k)
         .collect();
 
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    {
-        reg.load_counts = counts;
-    }
     if new_modules.is_empty() && removed.is_empty() && changed.is_empty() {
         return; // nothing changed
     }
@@ -165,6 +190,7 @@ pub fn refresh() {
     });
 
     reg.static_mods = current;
+    reg.static_seq += 1;
 }
 
 /// macOS: the dyld add/remove-image callbacks installed by [`init`] keep the module set
@@ -219,6 +245,7 @@ pub(crate) fn macos_end_batch() {
     for (k, fp, _) in &pending {
         reg.static_mods.insert(*k, *fp);
     }
+    reg.static_seq += 1;
     state::with_writer(|unw| {
         for (_k, _fp, m) in pending {
             unw.add_module(m);
@@ -242,6 +269,7 @@ pub(crate) fn macos_add_image(key: u64, fp: u64, module: Module<Bytes>) {
         unw.add_module(module);
     });
     reg.static_mods.insert(key, fp);
+    reg.static_seq += 1;
 }
 
 /// Drop one unloading image (dyld remove-image callback). The image is still mapped. See
@@ -255,6 +283,7 @@ pub(crate) fn macos_remove_image(key: u64) {
     if reg.static_mods.remove(&key).is_none() {
         return;
     }
+    reg.static_seq += 1;
     if reg.jit_keys.contains(&key) {
         return; // defensive: never drop a JIT module from the static path
     }
