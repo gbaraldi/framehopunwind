@@ -132,11 +132,9 @@ int fh_init(size_t num_slots);
  * sampling. */
 void fh_thread_register(void);
 
-/* Re-scan loaded modules (call after dlopen AND dlclose; JIT modules are preserved).
- * On Linux and FreeBSD, when nothing was loaded or unloaded since the last scan, it
- * returns after one quick check, so it can also be called before walks that may cross
- * libraries loaded by other code. On macOS this is a no-op once fh_init has run: dyld's
- * add/remove-image callbacks keep the module set current automatically. */
+/* Re-scan loaded modules. A walk uses the set of loaded objects as of the last call. Call
+ * before walks that can cross objects loaded or unloaded since the last call. JIT modules
+ * are unaffected. On macOS this call has no effect after fh_init. */
 void fh_modules_refresh(void);
 
 /* Diagnostics: number of JIT modules currently registered, and the cumulative count of

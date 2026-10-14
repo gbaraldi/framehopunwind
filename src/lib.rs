@@ -128,9 +128,10 @@ mod api {
         crate::state::thread_registered();
     }
 
-    /// Re-scan loaded modules (call after `dlopen`/`dlclose`). On Linux and FreeBSD it
-    /// returns after one quick check when nothing was loaded or unloaded since the last scan.
-    /// Not async-signal-safe.
+    /// Re-scan loaded modules. A walk uses the set of loaded objects as of the last call.
+    /// Call before walks that can cross objects loaded or unloaded since the last call. JIT
+    /// modules are unaffected. May be called while the loader lock is held. Not
+    /// async-signal-safe. On macOS this call has no effect after `fh_init`.
     #[no_mangle]
     pub extern "C" fn fh_modules_refresh() {
         crate::modules::refresh();
