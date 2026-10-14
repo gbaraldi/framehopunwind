@@ -30,13 +30,36 @@ use framehop::{
     UnwinderNative,
 };
 
-/// Unwind-section and code bytes. A loaded object's are read in place (`Mapped`): a walk
-/// only looks up addresses on the stack it walks, and an object cannot be unloaded while
-/// its code is on a stack. A JIT module's `.eh_frame` is copied (`Owned`), so the embedder
-/// may free its buffer once it deregisters the module.
+/// Unwind-section and code bytes.
+///
+/// `Mapped` bytes are read in place and are valid only while their object stays mapped.
+/// They are safe where a synchronous unload callback removes the module from the published
+/// set before the loader unmaps it (dyld remove-image on macOS). A walk that holds an older
+/// snapshot never looks the module up, because no live frame can be inside an object that
+/// is being unloaded.
+///
+/// `Owned` bytes are copies. ELF and Windows have no unload callback here, so a module can
+/// stay in the set after its object is unloaded. If the loader reuses that address range, a
+/// walk through live code there looks the stale module up. Thus unwind tables are copies
+/// there: a copy gives wrong frames until the next refresh, but mapped bytes give reads of
+/// freed memory. JIT `.eh_frame` is copied so that the embedder can free its buffer after
+/// it deregisters the module.
+///
+/// Code bytes are `Mapped` everywhere. framehop analyzes Mach-O prologues and epilogues and
+/// PE epilogues only for the first frame of a walk, and a first frame is code that the
+/// thread will return to. On x86-64 Mach-O, framehop also reads the `sub rsp` immediate for
+/// any frame whose compact-unwind opcode is frameless-indirect. This read is safe because
+/// dyld drops the module before the image is unmapped, so a correct walk never reaches it.
 pub enum Bytes {
     Owned(Box<[u8]>),
     Mapped(&'static [u8]),
+}
+
+impl Bytes {
+    /// An owned copy of `bytes`.
+    pub fn copy_of(bytes: &[u8]) -> Self {
+        Bytes::Owned(Box::from(bytes))
+    }
 }
 
 impl core::ops::Deref for Bytes {

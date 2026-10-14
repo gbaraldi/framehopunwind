@@ -244,8 +244,8 @@ pub(crate) fn macos_add_image(key: u64, fp: u64, module: Module<Bytes>) {
     reg.static_mods.insert(key, fp);
 }
 
-/// Drop one unloading image (dyld remove-image callback). The callback runs while the
-/// image is still mapped, so a concurrent reader of the *current* snapshot is unaffected.
+/// Drop one unloading image (dyld remove-image callback). The image is still mapped. See
+/// `Bytes` for why a walk on an older snapshot stays safe.
 #[cfg(target_os = "macos")]
 pub(crate) fn macos_remove_image(key: u64) {
     let mut reg = registry();

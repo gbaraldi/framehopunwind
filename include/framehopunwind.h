@@ -32,12 +32,12 @@
  * fault. This crate does NOT install its own SIGSEGV handler (it would conflict with the
  * embedder's, e.g. Julia's).
  *
- * The unwind tables and code of loaded objects are read in place, not copied. A walk only
- * looks them up for addresses on the stack it walks, and an object cannot be unloaded
- * while its code is on a stack, so this is safe for any correct walk. A bad unwind step
- * that produces an address inside an object being unloaded at that moment can fault, as
- * can the stale module of an object unloaded since the last fh_modules_refresh on
- * Linux/FreeBSD.
+ * Module lifetime. A walk unwinds with the set of loaded objects as it was at the last
+ * fh_modules_refresh. On macOS, the loader instead keeps the set current, so
+ * fh_modules_refresh has no effect after fh_init. A walk without a preceding refresh is
+ * still safe. Frames in objects loaded since the last refresh are unwound by frame pointer.
+ * A stale module can give incorrect frames in the former address range of its object, but
+ * never causes a read of unmapped memory. Instruction bytes are read in place.
  *
  * Surviving a faulting read by longjmp-ing out of fh_step (Julia's jl_set_safe_restore)
  * crosses this library's Rust frames — defined behavior only while they hold no pending

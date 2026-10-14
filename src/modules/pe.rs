@@ -3,10 +3,11 @@
 //! `ExplicitModuleSectionInfo` cannot produce a framehop PE module (it has no
 //! `.pdata`/`.xdata`/`.rdata` arm), so we implement [`framehop::ModuleSectionInfo`]
 //! ourselves and return those sections. Modules are enumerated with
-//! `EnumProcessModules` + `GetModuleInformation` (done off any thread-suspend window),
-//! each module is **pinned** (`GetModuleHandleExW`, released with `FreeLibrary`) while
-//! its in-memory PE image is parsed, so a concurrent `FreeLibrary` elsewhere cannot unmap
-//! the image under us. The module then reads its sections in place (see `Bytes`).
+//! `EnumProcessModules` + `GetModuleInformation` (done off any thread-suspend window).
+//! While the enumeration parses an image and copies its unwind sections, it pins the
+//! module (`GetModuleHandleExW`, released with `FreeLibrary`), so a concurrent
+//! `FreeLibrary` cannot unmap the image. `.text` is read in place, and only for the first
+//! frame of a walk (see `Bytes`).
 //!
 //! Note: Julia's Windows sampler suspends the target thread and unwinds on a *separate*
 //! thread, so the (allocating) PE path here is fine — but enumeration must not run while a
@@ -150,7 +151,7 @@ unsafe fn build_pe_module(base: u64, size: u64) -> Option<Module<Bytes>> {
 
     // Read section-header fields through copy helpers (the in-memory image is only
     // guaranteed byte-aligned, so we never form a reference to the packed struct).
-    let sec = |want: &[u8]| -> Option<(u32, Bytes)> {
+    let sec = |want: &[u8], copy: bool| -> Option<(u32, Bytes)> {
         for i in 0..num_sections {
             let sh_off = section_table + i * SECTION_HEADER_SIZE;
             let mut name = [0u8; 8];
@@ -166,18 +167,22 @@ unsafe fn build_pe_module(base: u64, size: u64) -> Option<Module<Bytes>> {
                 if len == 0 {
                     return None;
                 }
-                let bytes =
-                    Bytes::Mapped(core::slice::from_raw_parts(base_ptr.add(rva as usize), len));
+                let bytes = core::slice::from_raw_parts(base_ptr.add(rva as usize), len);
+                let bytes = if copy {
+                    Bytes::copy_of(bytes)
+                } else {
+                    Bytes::Mapped(bytes)
+                };
                 return Some((rva, bytes));
             }
         }
         None
     };
 
-    let pdata = sec(b".pdata")?; // no .pdata => not framehop-unwindable here
-    let xdata = sec(b".xdata");
-    let rdata = sec(b".rdata");
-    let text = sec(b".text");
+    let pdata = sec(b".pdata", true)?; // no .pdata => not framehop-unwindable here
+    let xdata = sec(b".xdata", true);
+    let rdata = sec(b".rdata", true); // MSVC places unwind info in .rdata
+    let text = sec(b".text", false);
 
     let info = PeSectionInfo {
         base_svma: base,
