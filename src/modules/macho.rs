@@ -79,7 +79,7 @@ extern "C" fn on_add_image(header: *const libc::mach_header, slide: libc::intptr
     if let Some((key, fp, Some(m))) =
         unsafe { build_image(header as *const libc::mach_header_64, slide as u64) }
     {
-        super::macos_add_image(key, fp, m);
+        super::image_added(key, fp, Some(m));
     }
 }
 
@@ -89,7 +89,7 @@ extern "C" fn on_remove_image(header: *const libc::mach_header, slide: libc::int
     }
     // SAFETY: the unloading image is still mapped while the callback runs.
     if let Some(key) = unsafe { image_key(header as *const libc::mach_header_64, slide as u64) } {
-        super::macos_remove_image(key);
+        super::image_removed(key);
     }
 }
 
