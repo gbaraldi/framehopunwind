@@ -32,12 +32,18 @@
  * fault. This crate does NOT install its own SIGSEGV handler (it would conflict with the
  * embedder's, e.g. Julia's).
  *
- * The unwind tables and code of loaded objects are read in place, not copied. A walk only
- * looks them up for addresses on the stack it walks, and an object cannot be unloaded
- * while its code is on a stack, so this is safe for any correct walk. A bad unwind step
- * that produces an address inside an object being unloaded at that moment can fault, as
- * can the stale module of an object unloaded since the last fh_modules_refresh on
- * Linux/FreeBSD.
+ * Module lifetime. The unwind tables and code of loaded objects are read in place, never
+ * copied. On macOS and Windows, the loader's callbacks keep the module set current: an
+ * object's module is removed before the object is unmapped. On Linux and FreeBSD, call
+ * fh_modules_refresh after every dlopen and dlclose; until then, walks use the old set, and
+ * frames in newly loaded objects are unwound by frame pointer. Windows works the same way
+ * if it does not accept this library's DLL notifications.
+ *
+ * Unloading can make a walk fault. A walk that runs while an object is unloaded can read
+ * the unmapped object after a bad unwind step. On Linux and FreeBSD, a dlclose without a
+ * following fh_modules_refresh also leaves a module whose tables may be unmapped. Embedders
+ * that unload objects must not walk while doing so, or must recover from the fault, as
+ * Julia does with jl_set_safe_restore.
  *
  * Surviving a faulting read by longjmp-ing out of fh_step (Julia's jl_set_safe_restore)
  * crosses this library's Rust frames — defined behavior only while they hold no pending
@@ -134,8 +140,13 @@ void fh_thread_register(void);
 
 /* Re-scan loaded modules. A walk uses the set of loaded objects as of the last call. Call
  * before walks that can cross objects loaded or unloaded since the last call. JIT modules
- * are unaffected. On macOS this call has no effect after fh_init. */
+ * are unaffected. On macOS and Windows this call has no effect after fh_init. */
 void fh_modules_refresh(void);
+
+/* Unregisters the loader callbacks of this library. Must be called once before process
+ * exit or before this library is unloaded, after profiling stops. On platforms other than
+ * Windows this call has no effect. */
+void fh_fini(void);
 
 /* Diagnostics: number of JIT modules currently registered, and the cumulative count of
  * failed JIT registrations (bad arguments or unparsable .eh_frame — such code falls back

@@ -30,10 +30,10 @@ use framehop::{
     UnwinderNative,
 };
 
-/// Unwind-section and code bytes. A loaded object's are read in place (`Mapped`): a walk
-/// only looks up addresses on the stack it walks, and an object cannot be unloaded while
-/// its code is on a stack. A JIT module's `.eh_frame` is copied (`Owned`), so the embedder
-/// may free its buffer once it deregisters the module.
+/// Unwind-section and code bytes. A loaded object's are read in place (`Mapped`) and are
+/// valid only while the object stays mapped (see "Module lifetime" in the header). A JIT
+/// module's `.eh_frame` is copied (`Owned`), so the embedder may free its buffer once it
+/// deregisters the module.
 pub enum Bytes {
     Owned(Box<[u8]>),
     Mapped(&'static [u8]),
