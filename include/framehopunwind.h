@@ -140,7 +140,8 @@ void fh_thread_register(void);
 
 /* Re-scan loaded modules. A walk uses the set of loaded objects as of the last call. Call
  * before walks that can cross objects loaded or unloaded since the last call. JIT modules
- * are unaffected. On macOS and Windows this call has no effect after fh_init. */
+ * are unaffected. On macOS and Windows this call has no effect after fh_init, unless
+ * Windows does not accept this library's DLL notifications. */
 void fh_modules_refresh(void);
 
 /* Unregisters the loader callbacks of this library. Must be called once before process
