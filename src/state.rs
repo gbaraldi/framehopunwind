@@ -189,6 +189,30 @@ struct WriterState {
 // SAFETY: only ever accessed under the `WRITER` mutex, on non-signal threads.
 unsafe impl Send for WriterState {}
 
+// ---------------------------------------------------------------------------
+// Internal invariants behind the concurrency contract in include/framehopunwind.h.
+//
+// Read path (guarantee 1): code from fh_cursor_init to fh_cursor_fini must not allocate, take a
+// lock, create a thread, call the loader, or touch thread-local storage that fh_thread_register did
+// not pre-fault. Slots and their caches are preallocated. The path reads an immutable snapshot of
+// the module set through an atomic pointer and a hazard pointer. Stack reads are bounded volatile
+// loads. tests/cache_wrap.rs checks that no allocation happens, and framehop's PE unit tests
+// check the same for its Windows x86-64 unwinder.
+//
+// Writers never wait for readers (guarantee 2): a publish swaps CURRENT and retires the old
+// snapshot. `reclaim` frees it only when no slot's hazard references it, and otherwise leaves it
+// for a later publish. A reader can hold a snapshot while its cursor is open, also while suspended.
+// This only delays one free. The slot chunk table is append-only and never freed, so the hazard
+// scan needs no coordination.
+//
+// Lock order (see modules/mod.rs): loader -> REGISTRY -> WRITER. Allocation under either lock is
+// permitted: the heap never waits on the loader or on this library. Module lifetime: see `Bytes`.
+//
+// Fault recovery: the embedder can longjmp out of fh_step after a faulting stack read, and must
+// still call fh_cursor_fini. Thus the frames between fh_step and the read must hold no pending
+// destructors. The read path has none.
+// ---------------------------------------------------------------------------
+
 /// The currently published snapshot. Null until the first publish.
 static CURRENT: AtomicPtr<Snapshot> = AtomicPtr::new(ptr::null_mut());
 

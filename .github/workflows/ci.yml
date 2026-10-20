@@ -9,12 +9,14 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Full build + unit tests + clippy + the C-ABI smoke test, on both native arches.
+  # Full build + unit tests + clippy + the C-ABI smoke test, on both native arches. On
+  # Windows, the module set comes from DLL notifications and frames go through the PE
+  # unwinder. The C tests use sh and cc, so they run on Unix only.
   test:
     strategy:
       fail-fast: false # one platform's failure shouldn't cancel the others' results
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -27,8 +29,10 @@ jobs:
         run: cargo test --locked --manifest-path vendor/framehop/Cargo.toml --lib
       - run: cargo clippy --all-targets -- -D warnings
       - name: C smoke test (public header + cdylib through the real C ABI)
+        if: runner.os != 'Windows'
         run: sh tests/run_c_smoke.sh
       - name: Stale-module test (a walk through code mapped into an unloaded object's range)
+        if: runner.os != 'Windows'
         run: sh tests/run_c_stale_module.sh
 
   # The declared rust-version must actually build the crate.

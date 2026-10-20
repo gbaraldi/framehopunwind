@@ -437,6 +437,19 @@ pub(crate) fn jit_register_failures() -> usize {
     jit::JIT_REGISTER_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Test hook: whether `key` is in the static module set, and the current sequence number.
+#[cfg(all(test, any(target_os = "macos", windows)))]
+pub(crate) fn static_module_state(key: u64) -> (bool, u64) {
+    let reg = registry();
+    (reg.static_mods.contains_key(&key), reg.static_seq)
+}
+
+/// Test hook: whether the DLL notifications keep the module set current.
+#[cfg(all(test, windows))]
+pub(crate) fn notifications_active() -> bool {
+    pe::notifications_active()
+}
+
 /// Hash helper for static-module fingerprints.
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn fingerprint_of(parts: &[u64], name: &[u8]) -> u64 {

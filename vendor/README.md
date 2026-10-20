@@ -29,6 +29,14 @@ so cloning an unwinder copies chunk pointers and a change copies only the chunk
 it touches. framehopunwind publishes a clone on every module change, which made
 each JIT registration proportional to the number of modules.
 
+Local patch: the x86-64 PE unwinder no longer collects a function's chained
+unwind infos and their operations into `Vec`s on a rule-cache miss. It validates
+the chain, then walks it twice without collecting: once to derive a cacheable
+rule, and if there is none, once to apply the operations. A chain longer than
+32 infos, which includes a cycle, is an unwind-info error instead of an endless
+loop. The read path must not allocate, because a Windows sampler unwinds a
+suspended thread that can hold the heap lock.
+
 Remove this vendored copy once an upstream release provides equivalent
-non-reusing module generations, signal-frame unwinding, and cheap module-list
-updates.
+non-reusing module generations, signal-frame unwinding, cheap module-list
+updates, and an allocation-free PE unwinder.
