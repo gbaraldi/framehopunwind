@@ -9,7 +9,11 @@
 //! before the image is unmapped. Thus the set is exact, and sections are read in place (see
 //! `Bytes`). The initial enumeration pins each module (`GetModuleHandleExW`, released
 //! with `FreeLibrary`) while it parses the image, so a concurrent `FreeLibrary` cannot
-//! unmap it.
+//! unmap it. An image that it parsed can be unloaded after the pin is released, before the
+//! result is published. The unloaded notification then makes the enumeration run again.
+//!
+//! If the notifications cannot be registered, nothing tells us of an unload, and
+//! `fh_modules_refresh` re-enumerates the set as on ELF.
 //!
 //! The notification callback runs with the loader busy: every `LoadLibrary`, `FreeLibrary`
 //! and thread creation in the process waits until it returns. `GetModuleHandleExW`,
