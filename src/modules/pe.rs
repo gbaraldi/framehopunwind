@@ -9,7 +9,11 @@
 //! before the image is unmapped. Thus the set is exact, and sections are read in place (see
 //! `Bytes`). The initial enumeration pins each module (`GetModuleHandleExW`, released
 //! with `FreeLibrary`) while it parses the image, so a concurrent `FreeLibrary` cannot
-//! unmap it.
+//! unmap it. An image that it parsed can be unloaded after the pin is released, before the
+//! result is published. The unloaded notification then makes the enumeration run again.
+//!
+//! If the notifications cannot be registered, nothing tells us of an unload, and every
+//! enumeration copies the unwind sections, as on ELF. `.text` stays in place (see `Bytes`).
 //!
 //! The notification callback runs with the loader busy: every `LoadLibrary`, `FreeLibrary`
 //! and thread creation in the process waits until it returns. `GetModuleHandleExW`,
@@ -51,6 +55,8 @@ const SECTION_HEADER_SIZE: usize = 40;
 pub fn enumerate(known: &HashMap<u64, u64>) -> Option<EnumResult> {
     let mut current = HashMap::new();
     let mut new_modules = Vec::new();
+    // Without notifications, a module can outlive its image in the set.
+    let copy = !notifications_active();
 
     let process = unsafe { GetCurrentProcess() };
 
@@ -108,7 +114,7 @@ pub fn enumerate(known: &HashMap<u64, u64>) -> Option<EnumResult> {
             let fp = unsafe { fingerprint(base, size) };
             current.insert(key, fp);
             if known.get(&key) != Some(&fp) {
-                if let Some(module) = unsafe { build_pe_module(base, size) } {
+                if let Some(module) = unsafe { build_pe_module(base, size, copy) } {
                     new_modules.push((key, module));
                 }
             }
@@ -251,7 +257,7 @@ unsafe extern "system" fn on_notification(
         LDR_DLL_NOTIFICATION_REASON_LOADED => {
             // The image is mapped and the loader holds it until the callback returns.
             let fp = fingerprint(base, size);
-            let module = build_pe_module(base, size);
+            let module = build_pe_module(base, size, false);
             super::image_added(base, fp, module);
         }
         LDR_DLL_NOTIFICATION_REASON_UNLOADED => super::image_removed(base),
@@ -278,7 +284,8 @@ unsafe fn pe_timestamp(base: u64) -> u32 {
 }
 
 /// Parse the in-memory PE at `base` and build a framehop PE module if it has `.pdata`.
-unsafe fn build_pe_module(base: u64, size: u64) -> Option<Module<Bytes>> {
+/// `copy` copies the unwind sections instead of reading them in place.
+unsafe fn build_pe_module(base: u64, size: u64, copy: bool) -> Option<Module<Bytes>> {
     let base_ptr = base as *const u8;
     // IMAGE_DOS_HEADER: "MZ", e_lfanew at 0x3c.
     if read_u16(base_ptr, 0) != 0x5a4d {
@@ -297,7 +304,7 @@ unsafe fn build_pe_module(base: u64, size: u64) -> Option<Module<Bytes>> {
 
     // Read section-header fields through copy helpers (the in-memory image is only
     // guaranteed byte-aligned, so we never form a reference to the packed struct).
-    let sec = |want: &[u8]| -> Option<(u32, Bytes)> {
+    let sec = |want: &[u8], copy: bool| -> Option<(u32, Bytes)> {
         for i in 0..num_sections {
             let sh_off = section_table + i * SECTION_HEADER_SIZE;
             let mut name = [0u8; 8];
@@ -313,18 +320,22 @@ unsafe fn build_pe_module(base: u64, size: u64) -> Option<Module<Bytes>> {
                 if len == 0 {
                     return None;
                 }
-                let bytes =
-                    Bytes::Mapped(core::slice::from_raw_parts(base_ptr.add(rva as usize), len));
+                let bytes = core::slice::from_raw_parts(base_ptr.add(rva as usize), len);
+                let bytes = if copy {
+                    Bytes::copy_of(bytes)
+                } else {
+                    Bytes::Mapped(bytes)
+                };
                 return Some((rva, bytes));
             }
         }
         None
     };
 
-    let pdata = sec(b".pdata")?; // no .pdata => not framehop-unwindable here
-    let xdata = sec(b".xdata");
-    let rdata = sec(b".rdata"); // MSVC places unwind info in .rdata
-    let text = sec(b".text");
+    let pdata = sec(b".pdata", copy)?; // no .pdata => not framehop-unwindable here
+    let xdata = sec(b".xdata", copy);
+    let rdata = sec(b".rdata", copy); // MSVC places unwind info in .rdata
+    let text = sec(b".text", false);
 
     let info = PeSectionInfo {
         base_svma: base,

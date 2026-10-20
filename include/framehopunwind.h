@@ -34,10 +34,12 @@
  *
  * Module lifetime. A walk unwinds with the set of loaded objects as it was at the last
  * fh_modules_refresh. On macOS and Windows, the loader instead keeps the set current, so
- * fh_modules_refresh has no effect after fh_init. A walk without a preceding refresh is
- * still safe. Frames in objects loaded since the last refresh are unwound by frame pointer.
- * A stale module can give incorrect frames in the former address range of its object, but
- * never causes a read of unmapped memory. Instruction bytes are read in place.
+ * fh_modules_refresh has no effect after fh_init. If Windows does not accept this library's
+ * DLL notifications, fh_modules_refresh works as on Linux. A walk without a preceding
+ * refresh is still safe. Frames in objects loaded since the last refresh are unwound by
+ * frame pointer. A stale module can give incorrect frames in the former address range of
+ * its object, but never causes a read of unmapped memory. Instruction bytes are read in
+ * place.
  *
  * Surviving a faulting read by longjmp-ing out of fh_step (Julia's jl_set_safe_restore)
  * crosses this library's Rust frames — defined behavior only while they hold no pending
@@ -134,7 +136,8 @@ void fh_thread_register(void);
 
 /* Re-scan loaded modules. A walk uses the set of loaded objects as of the last call. Call
  * before walks that can cross objects loaded or unloaded since the last call. JIT modules
- * are unaffected. On macOS and Windows this call has no effect after fh_init. */
+ * are unaffected. On macOS and Windows this call has no effect after fh_init, unless
+ * Windows does not accept this library's DLL notifications. */
 void fh_modules_refresh(void);
 
 /* Unregisters the loader callbacks of this library. Must be called once before process

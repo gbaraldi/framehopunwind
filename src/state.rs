@@ -38,11 +38,11 @@ use framehop::{
 /// Windows). A walk that holds an older snapshot never looks the module up, because no live
 /// frame can be inside an object that is being unloaded.
 ///
-/// `Owned` bytes are copies. Linux and FreeBSD have no unload callback, so a module can stay
-/// in the set after its object is unloaded. If the loader reuses that address range, a walk
-/// through live code there looks the stale module up. Thus ELF unwind tables are copies: a
-/// copy gives wrong frames until the next refresh, but mapped bytes give reads of freed
-/// memory. JIT `.eh_frame` is copied so that the embedder can free its buffer after it
+/// `Owned` bytes are copies. Linux and FreeBSD have no unload callback, and neither has
+/// Windows if the DLL notifications cannot be registered. There, a module can stay in the
+/// set after its object is unloaded. If the loader reuses that address range, a walk through
+/// live code there looks the stale module up. Thus unwind tables there are copies: a copy
+/// gives wrong frames until the next refresh, but mapped bytes give reads of freed memory. JIT `.eh_frame` is copied so that the embedder can free its buffer after it
 /// deregisters the module.
 ///
 /// Code bytes are `Mapped` everywhere. framehop analyzes Mach-O prologues and epilogues and

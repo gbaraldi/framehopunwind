@@ -131,7 +131,8 @@ mod api {
     /// Re-scan loaded modules. A walk uses the set of loaded objects as of the last call.
     /// Call before walks that can cross objects loaded or unloaded since the last call. JIT
     /// modules are unaffected. May be called while the loader lock is held. Not
-    /// async-signal-safe. On macOS and Windows this call has no effect after `fh_init`.
+    /// async-signal-safe. On macOS and Windows this call has no effect after `fh_init`,
+    /// unless Windows does not accept this library's DLL notifications.
     #[no_mangle]
     pub extern "C" fn fh_modules_refresh() {
         crate::modules::refresh();
