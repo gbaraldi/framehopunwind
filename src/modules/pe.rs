@@ -22,9 +22,9 @@
 //! never waits on the loader (see the lock order in `modules/mod.rs`). `FreeLibrary` waits
 //! on the loader, so the enumeration releases its pin before it takes the registry lock.
 //!
-//! Note: Julia's Windows sampler suspends the target thread and unwinds on a *separate*
-//! thread, so the (allocating) PE path here is fine — but enumeration must not run while a
-//! target is suspended (loader-lock hazard).
+//! Julia's Windows sampler suspends the target thread and unwinds it from a separate thread.
+//! The PE unwind path does not allocate (see `vendor/README.md`), so the target can hold the
+//! heap lock. Enumeration must not run while a target is suspended (loader-lock hazard).
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
