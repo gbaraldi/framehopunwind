@@ -18,10 +18,10 @@ use crate::cursor::{self, FhCursor};
 use crate::{capture, modules, state};
 
 /// Walk the frame-pointer chain from `start_rbp`, returning the return addresses
-/// `[*(rbp+8), *(*rbp+8), ...]`. x86_64, and Linux arm64, whose frame records have the same
-/// layout.
+/// `[*(rbp+8), *(*rbp+8), ...]`. x86_64 outside Windows, and Linux arm64, whose frame
+/// records have the same layout.
 #[cfg(any(
-    target_arch = "x86_64",
+    all(target_arch = "x86_64", not(windows)),
     all(target_os = "linux", target_arch = "aarch64")
 ))]
 fn fp_chain(mut rbp: u64, max: usize) -> Vec<u64> {
@@ -69,12 +69,26 @@ fn unwind_via_cursor(ctx: &FhContext, max: usize) -> Vec<u64> {
 
 /// Capture a context AND the frame-pointer chain in the *same* frame, then unwind via the
 /// cursor API. Returns (framehop ips, fp return addresses). `fh[1..]` should equal `fp[..]`.
+/// On Windows, `rbp` does not point at a frame record, so the OS unwinder is the oracle.
 #[inline(never)]
 fn capture_and_walk(max: usize) -> (Vec<u64>, Vec<u64>) {
     let mut ctx = FhContext::zeroed();
     capture::fh_capture_context(&mut ctx);
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", windows))]
+    let fp = {
+        use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
+        let mut frames = vec![core::ptr::null_mut(); max];
+        // Skip this frame's own address, as the frame-pointer walk does.
+        let n = unsafe {
+            RtlCaptureStackBackTrace(1, max as u32, frames.as_mut_ptr(), core::ptr::null_mut())
+        };
+        frames[..n as usize]
+            .iter()
+            .map(|&ip| ip as u64)
+            .collect::<Vec<_>>()
+    };
+    #[cfg(all(target_arch = "x86_64", not(windows)))]
     let fp = {
         let mut rbp: u64;
         unsafe { core::arch::asm!("mov {}, rbp", out(reg) rbp) };
@@ -329,6 +343,58 @@ fn stale_cursor_copy_cannot_release_reclaimed_slot() {
         "B's slot was corrupted by a stale fini: rc={rc} ip={ip:#x}"
     );
     cursor::cursor_fini(&mut b);
+}
+
+/// An unload notification for an image that is not in the set must still invalidate a
+/// running scan, which can have parsed the image before it was unloaded.
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn unload_of_unpublished_image_invalidates_scans() {
+    ensure_init();
+    let key = 0x7ff0_dead_0000; // no image is loaded here
+    let (known, seq) = modules::static_module_state(key);
+    assert!(!known);
+    modules::image_removed(key);
+    let (known, after) = modules::static_module_state(key);
+    assert!(!known);
+    assert!(after > seq, "the sequence number did not change");
+}
+
+/// The DLL notifications add a DLL to the set before `LoadLibrary` returns, and drop it
+/// before `FreeLibrary` unmaps it.
+#[cfg(windows)]
+#[test]
+fn dll_notifications_track_load_and_unload() {
+    use windows_sys::Win32::Foundation::FreeLibrary;
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, LoadLibraryA};
+
+    ensure_init();
+    assert!(modules::notifications_active());
+    // A system DLL that this process has not loaded on its own.
+    let name = [
+        c"msimg32.dll",
+        c"winmm.dll",
+        c"version.dll",
+        c"wtsapi32.dll",
+    ]
+    .into_iter()
+    .find(|name| unsafe { GetModuleHandleA(name.as_ptr().cast()) }.is_null())
+    .expect("every candidate DLL is already loaded");
+    let handle = unsafe { LoadLibraryA(name.as_ptr().cast()) };
+    assert!(!handle.is_null(), "cannot load {name:?}");
+    let base = handle as u64;
+    assert!(
+        modules::static_module_state(base).0,
+        "{name:?} is not in the set"
+    );
+    unsafe { FreeLibrary(handle) };
+    // Another thread can hold a reference, in which case the DLL stays loaded.
+    if unsafe { GetModuleHandleA(name.as_ptr().cast()) }.is_null() {
+        assert!(
+            !modules::static_module_state(base).0,
+            "{name:?} is still in the set"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
