@@ -38,12 +38,23 @@ use framehop::{
 /// Windows). A walk that holds an older snapshot never looks the module up, because no live
 /// frame can be inside an object that is being unloaded.
 ///
-/// `Owned` bytes are copies. Linux and FreeBSD have no unload callback, so a module can stay
-/// in the set after its object is unloaded. If the loader reuses that address range, a walk
-/// through live code there looks the stale module up. Thus ELF unwind tables are copies: a
-/// copy gives wrong frames until the next refresh, but mapped bytes give reads of freed
-/// memory. JIT `.eh_frame` is copied so that the embedder can free its buffer after it
-/// deregisters the module.
+/// Linux and FreeBSD have no unload callback, so a module can stay in the set after its
+/// object is unloaded. If the loader reuses that address range, a walk through live code
+/// there looks the stale module up. Thus ELF unwind tables must stay readable after an
+/// unload: stale tables give wrong frames until the next refresh, but bytes read in place
+/// give reads of freed memory. ELF tables are `File` bytes where the object's file can be
+/// mapped again, and `Owned` elsewhere. The objects that the kernel maps (the executable,
+/// the interpreter, the vDSO) are never unloaded, so their tables are `Mapped`.
+///
+/// `Owned` bytes are copies. JIT `.eh_frame` is copied so that the embedder can free its
+/// buffer after it deregisters the module.
+///
+/// `File` bytes are a slice of a private mapping of the object's file (see `FileMap`). The
+/// mapping keeps its own reference to the file, so it outlives the loader's mapping, and
+/// its pages are read in only when a walk touches them. It holds the bytes the loader
+/// mapped, because the loader does not write to `.eh_frame` in an object without text
+/// relocations. One hazard is added: a read past the end of a file that something
+/// truncated in place after the mapping was made raises SIGBUS.
 ///
 /// Code bytes are `Mapped` everywhere. framehop analyzes Mach-O prologues and epilogues and
 /// PE epilogues only for the first frame of a walk, and a first frame is code that the
@@ -53,6 +64,8 @@ use framehop::{
 pub enum Bytes {
     Owned(Box<[u8]>),
     Mapped(&'static [u8]),
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    File(std::sync::Arc<FileMap>, core::ops::Range<usize>),
 }
 
 impl Bytes {
@@ -68,9 +81,52 @@ impl core::ops::Deref for Bytes {
         match self {
             Bytes::Owned(bytes) => bytes,
             Bytes::Mapped(bytes) => bytes,
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            Bytes::File(map, range) => &map.bytes()[range.start..range.end],
         }
     }
 }
+
+/// A private, read-only mapping of part of a file, unmapped on drop.
+///
+/// The `Arc` that owns it is cloned and dropped only off the signal path, with the snapshot
+/// that holds it, so `Deref` on the read path touches no reference count.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+pub struct FileMap {
+    ptr: *const u8,
+    len: usize,
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+impl FileMap {
+    /// Takes ownership of the mapping `[ptr, ptr + len)`.
+    ///
+    /// # Safety
+    /// `ptr` and `len` must be the result of a successful `mmap` with `PROT_READ`, and no
+    /// one else may unmap it.
+    pub unsafe fn from_raw(ptr: *const u8, len: usize) -> Self {
+        FileMap { ptr, len }
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        // SAFETY: the mapping is readable and stays mapped until drop (see `from_raw`).
+        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+impl Drop for FileMap {
+    fn drop(&mut self) {
+        // SAFETY: we own the mapping (see `from_raw`).
+        unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.len) };
+    }
+}
+
+// SAFETY: the mapping is read-only and owned by this value.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+unsafe impl Send for FileMap {}
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+unsafe impl Sync for FileMap {}
 
 impl Default for Bytes {
     fn default() -> Self {

@@ -4,9 +4,10 @@
  * Without an unload callback (Linux, FreeBSD) the unloaded object's module stays in the
  * published set. When the loader maps another object into that range, a walk through its
  * code looks the stale module up. With unwind tables read in place that dereferenced the
- * old object's unmapped pages; with copied tables the lookup is served from the copy and
- * the walk continues. Plugin A is unloaded and plugin B loaded into its range; see
- * stale_plugin.c for how the sizes make that placement happen. */
+ * old object's unmapped pages; with copied tables, or tables in a separate mapping of the
+ * object's file, the lookup is served from those and the walk continues. Plugin A is
+ * unloaded and plugin B loaded into its range; see stale_plugin.c for how the sizes make
+ * that placement happen. */
 #ifndef _WIN32
 #define _GNU_SOURCE
 #endif

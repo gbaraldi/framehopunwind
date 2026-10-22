@@ -14,7 +14,10 @@ cargo build --release
 
 CC=${CC:-cc}
 out=target/c_stale_module
-$CC -O1 -fPIC -shared -fno-omit-frame-pointer -DPLUGIN_PAD_MB=64 tests/stale_plugin.c -o "$out-a.so"
+# Plugin A has no build ID, so the file check that guards the remapped tables falls back
+# to comparing .eh_frame_hdr.
+$CC -O1 -fPIC -shared -fno-omit-frame-pointer -DPLUGIN_PAD_MB=64 -Wl,--build-id=none \
+    tests/stale_plugin.c -o "$out-a.so"
 $CC -O1 -fPIC -shared -fno-omit-frame-pointer -DPLUGIN_PAD_MB=32 tests/stale_plugin.c -o "$out-b.so"
 $CC -O2 -g -fno-omit-frame-pointer -Iinclude tests/c_stale_module.c -o "$out" \
     -Ltarget/release -lframehopunwind -Wl,-rpath,"$PWD/target/release" -ldl -lpthread
