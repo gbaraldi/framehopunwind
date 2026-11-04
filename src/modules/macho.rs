@@ -57,14 +57,16 @@ extern "C" {
 static CALLBACKS: Once = Once::new();
 
 /// Install the dyld image callbacks (idempotent). Registration replays the add callback
-/// for every already-loaded image synchronously, so batch those into one snapshot.
+/// for every already-loaded image synchronously, so batch those into one snapshot. The
+/// remove callback is registered first: dyld does not replay removals, so an image unloaded
+/// during the replay would otherwise stay in the batch and be published.
 pub fn init_callbacks() {
     CALLBACKS.call_once(|| {
         super::macos_begin_batch();
         // SAFETY: registering process-lifetime callbacks; this cdylib is never unloaded.
         unsafe {
-            _dyld_register_func_for_add_image(on_add_image);
             _dyld_register_func_for_remove_image(on_remove_image);
+            _dyld_register_func_for_add_image(on_add_image);
         }
         super::macos_end_batch();
     });
