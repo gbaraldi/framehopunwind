@@ -33,9 +33,31 @@ The one bounded resource is the cursor **slot pool**. It starts at `fh_init(num_
 
 1. give walks exact bounds — `fh_thread_register` covers same-thread walks on that thread's own pthread stack; for **cross-thread** walks (a sampler unwinding a suspended target) or walks over embedder-managed stacks (e.g. Julia task stacks) the registered bounds *cannot* apply, so pass the target's stack range to `fh_cursor_init_bounds`. With exact bounds, out-of-stack reads become a clean end-of-stack instead of a fault;
 2. call `fh_thread_register` once on every thread that will **run** the unwinder (including sampler/listener threads), off the signal/suspend path — it also pre-faults this library's thread-local storage, whose first access can otherwise allocate (dyld lazy TLV on macOS, `__tls_get_addr` on ELF) at exactly the wrong moment;
-3. always run `fh_cursor_fini` for each successful `fh_cursor_init`, **including on fault recovery** — if a SIGSEGV-recovery `longjmp` skips `fh_cursor_fini`, that slot leaks and the pool eventually drains. Julia is safe here because `jl_set_safe_restore`'s `setjmp` is local to `jl_unw_stepn`, so a caught fault still returns to the caller that runs `fh_cursor_fini`. Note also that such a `longjmp` crosses this library's Rust frames, which is defined behavior only while those frames hold no pending destructors — the read path is written allocation- and destructor-free to keep that true, but exact bounds (which avoid the fault entirely) are the *supported* configuration and the `longjmp` path is best-effort.
+3. always run `fh_cursor_fini` for each successful `fh_cursor_init`, **including on fault recovery** — if a SIGSEGV-recovery `longjmp` skips `fh_cursor_fini`, that slot leaks and the pool eventually drains. Julia is safe here because `jl_set_safe_restore`'s `setjmp` is local to `jl_unw_stepn`, so a caught fault still returns to the caller that runs `fh_cursor_fini`. Note also that such a `longjmp` crosses this library's Rust frames, which Rust defines only for frames without destructors. The read path holds no allocations or locks, but some of framehop's frames hold values with trivial destructors, so the `longjmp` path is best-effort. Exact stack bounds keep stack reads from faulting.
 
-The unwind tables and code of loaded objects are read in place, not copied. A walk only looks them up for addresses on the stack it walks, and an object cannot be unloaded while its code is on a stack, so this is safe for any correct walk. A bad unwind step landing in an object that is being unloaded at that moment can still fault, as can the stale module of an object unloaded since the last `fh_modules_refresh` on Linux/FreeBSD; embedders that unload libraries should recover from such faults as they do for stack reads.
+## Concurrency contract
+
+### Definitions
+
+The *read path* is `fh_capture_context`, `fh_context_from_ucontext`, `fh_cursor_init*`, `fh_step`, `fh_get_reg` and `fh_cursor_fini`. The *mutating path* is every other entry point, plus the loader callbacks that this library installs on macOS and Windows. A *suspending thread* has suspended another thread and has not yet resumed it.
+
+### Guarantees
+
+1. The read path acquires nothing: no lock, heap allocation, loader call, thread creation, or first touch of thread-local storage. It never waits for another thread and is async-signal-safe. Starting a cursor retries only if a writer publishes at the same moment.
+2. Readers and writers never wait for each other.
+
+### Obligations on the embedder
+
+3. A suspending thread must call only the read path until it resumes its target. The target can hold any lock in the process, including the heap lock, the loader lock, and this library's locks. The read path waits on none of them (guarantee 1). But `fh_modules_refresh`, JIT registration, and any call that allocates or loads a library can wait on the target forever. This applies to every path that suspends a thread to walk it, not only the profiler.
+4. The embedder must not call the mutating path from a signal handler. It can call that path while the loader lock is held, for example from a library constructor.
+5. Where this library installs loader callbacks (Windows), the embedder must call `fh_fini` once before process exit or before it unloads this library, after profiling stops. Otherwise, a loader notification during process teardown can hang, and one after the unload can call into unmapped code.
+6. The embedder must not walk while it unloads an object, or must recover from the fault this can cause. On Linux and FreeBSD, and on Windows without DLL notifications, it must also call `fh_modules_refresh` after every `dlclose` (see Module lifetime).
+
+### Module lifetime
+
+The unwind tables and code of loaded objects are read in place, never copied. On macOS and Windows, the loader's callbacks keep the module set current: an object's module is removed before the object is unmapped. On Linux and FreeBSD, call `fh_modules_refresh` after every `dlopen` and `dlclose` (obligations 3, 4 and 6). Until then, walks use the old set, and frames in newly loaded objects are unwound by frame pointer. Windows works the same way if it does not accept this library's DLL notifications.
+
+Unloading can make a walk fault. A walk that runs while an object is unloaded can read the unmapped object. On Linux and FreeBSD, and on Windows without DLL notifications, a `dlclose` without a following `fh_modules_refresh` also leaves a module whose tables may be unmapped. Julia recovers from such faults with `jl_set_safe_restore`.
 
 See the header for the full contract.
 
@@ -59,8 +81,7 @@ framehop is x86_64 + aarch64 only, and its PE backend is x86_64-only.
 
 * **Hazard-pointer snapshot** (`src/state.rs`): writers publish a fresh immutable `Snapshot` (cloned framehop `Unwinder` + the mutation) via an atomic pointer; a reader publishes the pointer it is about to use into a global hazard slot and re-checks it is still current, guaranteeing the writer won't free a snapshot under a live reader. Reclamation happens on the writer thread.
 * **Cache lifetime**: the vendored framehop patch (`vendor/README.md`) uses a non-reusing 64-bit module generation in its rule-cache keys. Cursors may retain their caches across arbitrarily many snapshots without periodic sweeps or reader-side resets.
-* **Owned bytes**: all unwind sections (`.eh_frame`, `__unwind_info`, `.pdata`, …) are *copied* into owned memory at registration, so a later `dlclose`/`munmap` or a Julia free of a JIT buffer cannot dangle a snapshot mid-read.
-  Mach-O `__TEXT` bytes are retained regardless of image size: compact unwind needs them for prologues, epilogues, and indirect stack sizes. Large images therefore increase memory use by the size of their copied text segments; snapshots share these immutable copies.
+* **In-place bytes**: the unwind sections and code of loaded objects (`.eh_frame`, `__unwind_info`, `__TEXT`, `.pdata`, …) are read where the loader mapped them, never copied (see Module lifetime). Only a JIT module's `.eh_frame` is copied at registration, so the embedder may free its buffer once it deregisters the module.
 * **JIT `.eh_frame` mapping** (the correctness crux, verified against framehop 0.16 + gimli 0.33): `base_svma == base_avma == text_lo`, and `eh_frame_svma.start` is set to the **runtime** address of the eh_frame buffer so gimli resolves `DW_EH_PE_pcrel` `pc_begin` correctly.
 
 ## Build

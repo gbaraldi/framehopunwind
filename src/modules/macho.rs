@@ -57,14 +57,16 @@ extern "C" {
 static CALLBACKS: Once = Once::new();
 
 /// Install the dyld image callbacks (idempotent). Registration replays the add callback
-/// for every already-loaded image synchronously, so batch those into one snapshot.
+/// for every already-loaded image synchronously, so batch those into one snapshot. The
+/// remove callback is registered first: dyld does not replay removals, so an image unloaded
+/// during the replay would otherwise stay in the batch and be published.
 pub fn init_callbacks() {
     CALLBACKS.call_once(|| {
         super::macos_begin_batch();
         // SAFETY: registering process-lifetime callbacks; this cdylib is never unloaded.
         unsafe {
-            _dyld_register_func_for_add_image(on_add_image);
             _dyld_register_func_for_remove_image(on_remove_image);
+            _dyld_register_func_for_add_image(on_add_image);
         }
         super::macos_end_batch();
     });
@@ -79,7 +81,7 @@ extern "C" fn on_add_image(header: *const libc::mach_header, slide: libc::intptr
     if let Some((key, fp, Some(m))) =
         unsafe { build_image(header as *const libc::mach_header_64, slide as u64) }
     {
-        super::macos_add_image(key, fp, m);
+        super::image_added(key, fp, Some(m));
     }
 }
 
@@ -89,7 +91,7 @@ extern "C" fn on_remove_image(header: *const libc::mach_header, slide: libc::int
     }
     // SAFETY: the unloading image is still mapped while the callback runs.
     if let Some(key) = unsafe { image_key(header as *const libc::mach_header_64, slide as u64) } {
-        super::macos_remove_image(key);
+        super::image_removed(key);
     }
 }
 

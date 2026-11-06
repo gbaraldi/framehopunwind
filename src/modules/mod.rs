@@ -11,13 +11,20 @@
 //! [`init`]), which run synchronously under dyld's lock on every load and unload —
 //! including a replay for already-loaded images at installation time. This avoids the
 //! index-based `_dyld_image_count()` / `_dyld_get_image_header(i)` APIs, which can race
-//! with a concurrent unload (the header pointer dangles). On ELF/Windows the set is
-//! re-derived by [`refresh`].
+//! with a concurrent unload (the header pointer dangles). On Windows, [`init`] enumerates
+//! the set once, and the DLL notifications then maintain it. ELF has no unload callback, so
+//! [`refresh`] re-derives the set when the embedder calls it.
 //!
-//! Lock order is always REGISTRY -> WRITER (never the reverse); neither is ever taken on
-//! the signal path.
+//! Lock order is always loader -> REGISTRY -> WRITER, on every platform. The loader
+//! callbacks (dyld on macOS, DLL notifications on Windows) take REGISTRY under the loader
+//! lock. Thus code that holds REGISTRY or WRITER must not wait on the loader: no `dlopen`,
+//! `dlclose`, `dl_iterate_phdr`, `LoadLibrary`, `FreeLibrary` or thread creation under
+//! either lock. For this reason, `refresh` enumerates before it takes REGISTRY, and applies
+//! the result under it. The signal path takes neither lock.
 
 use std::collections::{HashMap, HashSet};
+#[cfg(windows)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use framehop::{Module, Unwinder};
@@ -60,6 +67,9 @@ struct Registry {
     /// ELF: the loader's load/unload counts at the last scan; see `elf::load_counts`.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     load_counts: Option<(u64, u64)>,
+    /// Bumped on every change to `static_mods` and on every unload notification, so that
+    /// `scan` can find a stale enumeration.
+    static_seq: u64,
     /// macOS: add-image events recorded during the initial dyld callback replay, published
     /// in one batch by `macos_end_batch` (one snapshot instead of one per preloaded image).
     #[cfg(target_os = "macos")]
@@ -76,6 +86,7 @@ static REGISTRY: LazyLock<Mutex<Registry>> = LazyLock::new(|| {
         jit_eh_frame_by_key: HashMap::new(),
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         load_counts: None,
+        static_seq: 0,
         #[cfg(target_os = "macos")]
         batching: false,
         #[cfg(target_os = "macos")]
@@ -87,38 +98,112 @@ fn registry() -> std::sync::MutexGuard<'static, Registry> {
     REGISTRY.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Bring up static-module tracking: install the dyld callbacks on macOS (which replays
-/// all already-loaded images), or do an initial scan elsewhere. Idempotent.
+/// Windows: a scan has published the set while the DLL notifications were registered.
+/// Until then, `refresh` scans: a failed initial scan would otherwise leave the objects
+/// loaded before `init` out of the set for good.
+#[cfg(windows)]
+static SCANNED: AtomicBool = AtomicBool::new(false);
+
+/// Bring up static-module tracking. Idempotent. On macOS, the dyld callbacks replay all
+/// already-loaded images when they are installed.
 pub fn init() {
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     crate::sigreturn::init();
     #[cfg(target_os = "macos")]
     macho::init_callbacks();
+    // Register before the scan, so that no load or unload is missed. The fingerprint
+    // reconciles an image that both report. A notification during the scan makes it re-run.
+    // Initialize the registry first, so that the callback never runs its first-use setup.
+    // If registration fails, `refresh` keeps re-enumerating the set, as on ELF.
+    #[cfg(windows)]
+    {
+        drop(registry());
+        pe::register_notifications();
+    }
     #[cfg(not(target_os = "macos"))]
-    refresh();
+    refresh_scan();
 }
 
-/// Re-scan loaded modules and publish a snapshot reflecting additions, removals, and
-/// changed images (same base, different fingerprint). JIT modules are preserved; a
-/// failed enumeration keeps the previous snapshot (an empty result must not read as
-/// "everything unloaded"). Off the signal path.
+/// Unregister the Windows DLL notifications, so that no callback runs during process
+/// teardown. A thread that `ExitProcess` killed can still own the registry lock there.
+/// Off the signal path.
+pub fn fini() {
+    #[cfg(windows)]
+    {
+        pe::unregister_notifications();
+        SCANNED.store(false, Ordering::Release);
+    }
+}
+
+/// Re-scan loaded modules (`fh_modules_refresh`). Off the signal path.
 #[cfg(not(target_os = "macos"))]
 pub fn refresh() {
-    let mut reg = registry();
+    #[cfg(windows)]
+    if pe::notifications_active() && SCANNED.load(Ordering::Acquire) {
+        return;
+    }
+    refresh_scan();
+}
+
+/// Run `scan`, and on Windows record whether the notifications now keep the set current.
+#[cfg(not(target_os = "macos"))]
+fn refresh_scan() {
+    #[cfg(windows)]
+    {
+        let active = pe::notifications_active();
+        if scan() && active {
+            SCANNED.store(true, Ordering::Release);
+        }
+    }
+    #[cfg(not(windows))]
+    scan();
+}
+
+/// Enumerate the loaded modules and publish a snapshot with additions, removals, and
+/// changed images (same base, different fingerprint). JIT modules are preserved. A failed
+/// enumeration keeps the previous snapshot: an empty result must not read as "everything
+/// unloaded". If the static set changed during the enumeration, the result can be stale,
+/// so the enumeration runs again. Returns whether the published set is now current.
+#[cfg(not(target_os = "macos"))]
+fn scan() -> bool {
     // Equal counts mean no object was loaded or unloaded since the last scan. Read them
     // before scanning, so a load during the scan is picked up by the next refresh.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     let counts = {
         let counts = elf::load_counts();
-        if counts.is_some() && counts == reg.load_counts {
-            return;
+        if counts.is_some() && counts == registry().load_counts {
+            return true;
         }
         counts
     };
-    let res = match enumerate_static(&reg.static_mods) {
-        Some(r) => r,
-        None => return, // enumeration failed; keep the current snapshot
-    };
+    for _attempt in 0..8 {
+        let (known, seq) = {
+            let reg = registry();
+            (reg.static_mods.clone(), reg.static_seq)
+        };
+        let res = match enumerate_static(&known) {
+            Some(r) => r,
+            None => return false,
+        };
+        let mut reg = registry();
+        if reg.static_seq != seq {
+            continue; // a callback or another scan changed the set
+        }
+        apply_scan(&mut reg, res);
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        {
+            reg.load_counts = counts;
+        }
+        return true;
+    }
+    // The set kept changing. Whoever made the last change published it, but objects that
+    // only this scan saw are not in the set.
+    false
+}
+
+/// Apply one enumeration under REGISTRY.
+#[cfg(not(target_os = "macos"))]
+fn apply_scan(reg: &mut Registry, res: EnumResult) {
     let EnumResult {
         current,
         new_modules,
@@ -140,10 +225,9 @@ pub fn refresh() {
         .map(|(k, _)| *k)
         .collect();
 
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    {
-        reg.load_counts = counts;
-    }
+    // Bump even when nothing changed: an older scan that is still running can have seen an
+    // object that this scan saw unloaded, and must not publish it.
+    reg.static_seq += 1;
     if new_modules.is_empty() && removed.is_empty() && changed.is_empty() {
         return; // nothing changed
     }
@@ -198,7 +282,9 @@ fn enumerate_static(known: &HashMap<u64, u64>) -> Option<EnumResult> {
 }
 
 // ---------------------------------------------------------------------------
-// macOS dyld-callback plumbing (called from macho.rs under dyld's lock).
+// Loader-callback plumbing: dyld's add/remove-image callbacks (macho.rs, under dyld's
+// lock) and Windows' DLL notifications (pe.rs, with the loader busy). Both publish
+// synchronously and never wait for a reader.
 // ---------------------------------------------------------------------------
 
 /// Begin batching add-image events (used around the initial dyld callback replay).
@@ -219,6 +305,7 @@ pub(crate) fn macos_end_batch() {
     for (k, fp, _) in &pending {
         reg.static_mods.insert(*k, *fp);
     }
+    reg.static_seq += 1;
     state::with_writer(|unw| {
         for (_k, _fp, m) in pending {
             unw.add_module(m);
@@ -226,32 +313,47 @@ pub(crate) fn macos_end_batch() {
     });
 }
 
-/// Record one loaded image (dyld add-image callback, or the installation replay).
-#[cfg(target_os = "macos")]
-pub(crate) fn macos_add_image(key: u64, fp: u64, module: Module<Bytes>) {
+/// Record one loaded image (dyld add-image callback or its installation replay; Windows
+/// loaded notification). `module` is `None` for an image without unwind info, which is
+/// still tracked so its unload and any base-address reuse are seen.
+#[cfg(any(target_os = "macos", windows))]
+pub(crate) fn image_added(key: u64, fp: u64, module: Option<Module<Bytes>>) {
     let mut reg = registry();
+    #[cfg(target_os = "macos")]
     if reg.batching {
-        reg.pending.push((key, fp, module));
+        if let Some(module) = module {
+            reg.pending.push((key, fp, module));
+        }
         return;
     }
     let replace = reg.static_mods.contains_key(&key);
-    state::with_writer(|unw| {
-        if replace {
-            unw.remove_module(key);
-        }
-        unw.add_module(module);
-    });
+    if replace || module.is_some() {
+        state::with_writer(|unw| {
+            if replace {
+                unw.remove_module(key);
+            }
+            if let Some(module) = module {
+                unw.add_module(module);
+            }
+        });
+    }
     reg.static_mods.insert(key, fp);
+    reg.static_seq += 1;
 }
 
-/// Drop one unloading image (dyld remove-image callback). The callback runs while the
-/// image is still mapped, so a concurrent reader of the *current* snapshot is unaffected.
-#[cfg(target_os = "macos")]
-pub(crate) fn macos_remove_image(key: u64) {
+/// Drop one unloading image (dyld remove-image callback, Windows unloaded notification).
+/// The image is still mapped, but a walk that already holds an older snapshot can still
+/// reach it after this returns (see "Module lifetime" in the header).
+#[cfg(any(target_os = "macos", windows))]
+pub(crate) fn image_removed(key: u64) {
     let mut reg = registry();
+    #[cfg(target_os = "macos")]
     if reg.batching {
         reg.pending.retain(|(k, _, _)| *k != key);
     }
+    // Bump even for an image that is not in the set: a running scan can have parsed it
+    // before this unload, and must not publish it after the image is unmapped.
+    reg.static_seq += 1;
     if reg.static_mods.remove(&key).is_none() {
         return;
     }
@@ -335,6 +437,19 @@ pub(crate) fn jit_module_count() -> usize {
 /// Cumulative count of failed JIT registrations (diagnostic).
 pub(crate) fn jit_register_failures() -> usize {
     jit::JIT_REGISTER_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Test hook: whether `key` is in the static module set, and the current sequence number.
+#[cfg(all(test, any(target_os = "macos", windows)))]
+pub(crate) fn static_module_state(key: u64) -> (bool, u64) {
+    let reg = registry();
+    (reg.static_mods.contains_key(&key), reg.static_seq)
+}
+
+/// Test hook: whether the DLL notifications keep the module set current.
+#[cfg(all(test, windows))]
+pub(crate) fn notifications_active() -> bool {
+    pe::notifications_active()
 }
 
 /// Hash helper for static-module fingerprints.

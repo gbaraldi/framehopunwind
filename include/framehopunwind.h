@@ -32,17 +32,56 @@
  * fault. This crate does NOT install its own SIGSEGV handler (it would conflict with the
  * embedder's, e.g. Julia's).
  *
- * The unwind tables and code of loaded objects are read in place, not copied. A walk only
- * looks them up for addresses on the stack it walks, and an object cannot be unloaded
- * while its code is on a stack, so this is safe for any correct walk. A bad unwind step
- * that produces an address inside an object being unloaded at that moment can fault, as
- * can the stale module of an object unloaded since the last fh_modules_refresh on
- * Linux/FreeBSD.
+ * ---------------------------------------------------------------------------
+ * Concurrency contract
+ * ---------------------------------------------------------------------------
+ * Definitions. The read path is fh_capture_context, fh_context_from_ucontext,
+ * fh_cursor_init*, fh_step, fh_get_reg and fh_cursor_fini. The mutating path is every other
+ * entry point, plus the loader callbacks that this library installs on macOS and Windows. A
+ * suspending thread has suspended another thread and has not yet resumed it.
+ *
+ * Guarantees.
+ *   1. The read path acquires nothing: no lock, heap allocation, loader call, thread
+ *      creation, or first touch of thread-local storage. It never waits for another
+ *      thread and is async-signal-safe. Starting a cursor retries only if a writer
+ *      publishes at the same moment.
+ *   2. Readers and writers never wait for each other.
+ *
+ * Obligations on the embedder.
+ *   3. A suspending thread must call only the read path until it resumes its target. The
+ *      target can hold any lock in the process, including the heap lock, the loader lock,
+ *      and this library's locks. The read path waits on none of them (guarantee 1). But
+ *      fh_modules_refresh, JIT registration, and any call that allocates or loads a library
+ *      can wait on the target forever. This applies to every path that suspends a thread to
+ *      walk it, not only the profiler.
+ *   4. The embedder must not call the mutating path from a signal handler. It can call that
+ *      path while the loader lock is held, for example from a library constructor.
+ *   5. Where this library installs loader callbacks (Windows), the embedder must call
+ *      fh_fini once before process exit or before it unloads this library, after profiling
+ *      stops. Otherwise, a loader notification during process teardown can hang, and one
+ *      after the unload can call into unmapped code.
+ *   6. The embedder must not walk while it unloads an object, or must recover from the
+ *      fault this can cause. On Linux and FreeBSD, and on Windows without DLL
+ *      notifications, it must also call fh_modules_refresh after every dlclose (see Module
+ *      lifetime).
+ *
+ * Module lifetime. The unwind tables and code of loaded objects are read in place, never
+ * copied. On macOS and Windows, the loader's callbacks keep the module set current: an
+ * object's module is removed before the object is unmapped. On Linux and FreeBSD, call
+ * fh_modules_refresh after every dlopen and dlclose (obligations 3, 4 and 6). Until then,
+ * walks use the old set, and frames in newly loaded objects are unwound by frame pointer.
+ * Windows works the same way if it does not accept this library's DLL notifications.
+ *
+ * Unloading can make a walk fault. A walk that runs while an object is unloaded can read
+ * the unmapped object. On Linux and FreeBSD, and on Windows without DLL notifications, a
+ * dlclose without a following fh_modules_refresh also leaves a module whose tables may be
+ * unmapped. Julia recovers from such faults with jl_set_safe_restore.
  *
  * Surviving a faulting read by longjmp-ing out of fh_step (Julia's jl_set_safe_restore)
- * crosses this library's Rust frames — defined behavior only while they hold no pending
- * destructors. The read path is kept destructor-free, but exact bounds (which avoid the
- * fault entirely) are the *supported* configuration; the longjmp path is best-effort.
+ * crosses this library's Rust frames, which Rust defines only for frames without
+ * destructors. The read path holds no allocations or locks, but some of framehop's frames
+ * hold values with trivial destructors, so the longjmp path is best-effort. Exact stack
+ * bounds keep stack reads from faulting.
  *
  * fh_thread_register also pre-faults this library's thread-local storage. Any thread
  * that will RUN the unwinder (including sampler/listener threads that only ever unwind
@@ -132,12 +171,17 @@ int fh_init(size_t num_slots);
  * sampling. */
 void fh_thread_register(void);
 
-/* Re-scan loaded modules (call after dlopen AND dlclose; JIT modules are preserved).
- * On Linux and FreeBSD, when nothing was loaded or unloaded since the last scan, it
- * returns after one quick check, so it can also be called before walks that may cross
- * libraries loaded by other code. On macOS this is a no-op once fh_init has run: dyld's
- * add/remove-image callbacks keep the module set current automatically. */
+/* Re-scan loaded modules. A walk uses the set of loaded objects as of the last call. Call
+ * after every dlopen and dlclose (obligation 6), where the mutating path is permitted
+ * (obligations 3 and 4). JIT modules are unaffected. If a scan fails, the set stays as it
+ * was. On macOS this call has no effect after fh_init. On Windows it rescans only until a
+ * scan succeeds while DLL notifications are active. */
 void fh_modules_refresh(void);
+
+/* Unregisters the loader callbacks of this library. Must be called once before process
+ * exit or before this library is unloaded, after profiling stops (obligation 5). On
+ * platforms other than Windows this call has no effect. */
+void fh_fini(void);
 
 /* Diagnostics: number of JIT modules currently registered, and the cumulative count of
  * failed JIT registrations (bad arguments or unparsable .eh_frame — such code falls back

@@ -128,12 +128,22 @@ mod api {
         crate::state::thread_registered();
     }
 
-    /// Re-scan loaded modules (call after `dlopen`/`dlclose`). On Linux and FreeBSD it
-    /// returns after one quick check when nothing was loaded or unloaded since the last scan.
-    /// Not async-signal-safe.
+    /// Re-scan loaded modules. A walk uses the set of loaded objects as of the last call.
+    /// Call after every `dlopen` and `dlclose`. JIT modules are unaffected. May be called
+    /// while the loader lock is held. Not async-signal-safe. On macOS and Windows this call
+    /// has no effect after `fh_init`, unless Windows does not accept this library's DLL
+    /// notifications.
     #[no_mangle]
     pub extern "C" fn fh_modules_refresh() {
         crate::modules::refresh();
+    }
+
+    /// Unregisters the loader callbacks of this library. Must be called once before process
+    /// exit or before this library is unloaded, after profiling stops. Not async-signal-safe.
+    /// On platforms other than Windows this call has no effect.
+    #[no_mangle]
+    pub extern "C" fn fh_fini() {
+        crate::modules::fini();
     }
 
     /// Diagnostic: number of JIT modules currently registered with framehop.
@@ -308,6 +318,8 @@ mod api_stub {
     pub extern "C" fn fh_thread_register() {}
     #[no_mangle]
     pub extern "C" fn fh_modules_refresh() {}
+    #[no_mangle]
+    pub extern "C" fn fh_fini() {}
     #[no_mangle]
     pub extern "C" fn fh_jit_module_count() -> usize {
         0

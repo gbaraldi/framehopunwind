@@ -30,10 +30,10 @@ use framehop::{
     UnwinderNative,
 };
 
-/// Unwind-section and code bytes. A loaded object's are read in place (`Mapped`): a walk
-/// only looks up addresses on the stack it walks, and an object cannot be unloaded while
-/// its code is on a stack. A JIT module's `.eh_frame` is copied (`Owned`), so the embedder
-/// may free its buffer once it deregisters the module.
+/// Unwind-section and code bytes. A loaded object's are read in place (`Mapped`) and are
+/// valid only while the object stays mapped (see "Module lifetime" in the header). A JIT
+/// module's `.eh_frame` is copied (`Owned`), so the embedder may free its buffer once it
+/// deregisters the module.
 pub enum Bytes {
     Owned(Box<[u8]>),
     Mapped(&'static [u8]),
@@ -165,6 +165,31 @@ struct WriterState {
 
 // SAFETY: only ever accessed under the `WRITER` mutex, on non-signal threads.
 unsafe impl Send for WriterState {}
+
+// ---------------------------------------------------------------------------
+// Internal invariants behind the concurrency contract in include/framehopunwind.h.
+//
+// Read path (guarantee 1): code from fh_cursor_init to fh_cursor_fini must not allocate, take a
+// lock, create a thread, call the loader, or touch thread-local storage that fh_thread_register did
+// not pre-fault. Slots and their caches are preallocated. The path reads an immutable snapshot of
+// the module set through an atomic pointer and a hazard pointer. Stack reads are bounded volatile
+// loads. tests/cache_wrap.rs checks that no allocation happens, and framehop's PE unit tests
+// check the same for its Windows x86-64 unwinder.
+//
+// Writers never wait for readers (guarantee 2): a publish swaps CURRENT and retires the old
+// snapshot. `reclaim` frees it only when no slot's hazard references it, and otherwise leaves it
+// for a later publish. A reader can hold a snapshot while its cursor is open, also while suspended.
+// This only delays one free. The slot chunk table is append-only and never freed, so the hazard
+// scan needs no coordination.
+//
+// Lock order (see modules/mod.rs): loader -> REGISTRY -> WRITER. Allocation under either lock is
+// permitted: the heap never waits on the loader or on this library. Module lifetime: see `Bytes`.
+//
+// Fault recovery: the embedder can longjmp out of fh_step after a faulting read, and must still
+// call fh_cursor_fini. Rust defines such a longjmp only across frames without destructors. The
+// read path holds no allocations or locks, but some framehop frames hold values with trivial
+// destructors (ArrayVec), so the header calls this path best-effort.
+// ---------------------------------------------------------------------------
 
 /// The currently published snapshot. Null until the first publish.
 static CURRENT: AtomicPtr<Snapshot> = AtomicPtr::new(ptr::null_mut());
