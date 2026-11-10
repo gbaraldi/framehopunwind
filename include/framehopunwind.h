@@ -56,10 +56,9 @@
  *      walk it, not only the profiler.
  *   4. The embedder must not call the mutating path from a signal handler. It can call that
  *      path while the loader lock is held, for example from a library constructor.
- *   5. Where this library installs loader callbacks (Windows), the embedder must call
- *      fh_fini once before process exit or before it unloads this library, after profiling
- *      stops. Otherwise, a loader notification during process teardown can hang, and one
- *      after the unload can call into unmapped code.
+ *   5. On Windows, the embedder must call fh_fini before it unloads this library, after
+ *      profiling stops. Otherwise, a loader notification after the unload calls into
+ *      unmapped code. Process exit needs no call.
  *   6. The embedder must not walk while it unloads an object, or must recover from the
  *      fault this can cause. On Linux and FreeBSD, and on Windows without DLL
  *      notifications, it must also call fh_modules_refresh after every dlclose (see Module
@@ -70,7 +69,8 @@
  * object's module is removed before the object is unmapped. On Linux and FreeBSD, call
  * fh_modules_refresh after every dlopen and dlclose (obligations 3, 4 and 6). Until then,
  * walks use the old set, and frames in newly loaded objects are unwound by frame pointer.
- * Windows works the same way if it does not accept this library's DLL notifications.
+ * Windows works the same way if it does not accept this library's DLL notifications. Once
+ * process shutdown has begun (ExitProcess), Windows no longer updates the set.
  *
  * Unloading can make a walk fault. A walk that runs while an object is unloaded can read
  * the unmapped object. On Linux and FreeBSD, and on Windows without DLL notifications, a
@@ -178,9 +178,9 @@ void fh_thread_register(void);
  * scan succeeds while DLL notifications are active. */
 void fh_modules_refresh(void);
 
-/* Unregisters the loader callbacks of this library. Must be called once before process
- * exit or before this library is unloaded, after profiling stops (obligation 5). On
- * platforms other than Windows this call has no effect. */
+/* Unregisters the loader callbacks of this library. Must be called before this library is
+ * unloaded, after profiling stops (obligation 5). On platforms other than Windows this call
+ * has no effect. */
 void fh_fini(void);
 
 /* Diagnostics: number of JIT modules currently registered, and the cumulative count of

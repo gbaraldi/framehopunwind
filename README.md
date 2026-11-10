@@ -50,12 +50,12 @@ The *read path* is `fh_capture_context`, `fh_context_from_ucontext`, `fh_cursor_
 
 3. A suspending thread must call only the read path until it resumes its target. The target can hold any lock in the process, including the heap lock, the loader lock, and this library's locks. The read path waits on none of them (guarantee 1). But `fh_modules_refresh`, JIT registration, and any call that allocates or loads a library can wait on the target forever. This applies to every path that suspends a thread to walk it, not only the profiler.
 4. The embedder must not call the mutating path from a signal handler. It can call that path while the loader lock is held, for example from a library constructor.
-5. Where this library installs loader callbacks (Windows), the embedder must call `fh_fini` once before process exit or before it unloads this library, after profiling stops. Otherwise, a loader notification during process teardown can hang, and one after the unload can call into unmapped code.
+5. On Windows, the embedder must call `fh_fini` before it unloads this library, after profiling stops. Otherwise, a loader notification after the unload calls into unmapped code. Process exit needs no call.
 6. The embedder must not walk while it unloads an object, or must recover from the fault this can cause. On Linux and FreeBSD, and on Windows without DLL notifications, it must also call `fh_modules_refresh` after every `dlclose` (see Module lifetime).
 
 ### Module lifetime
 
-The unwind tables and code of loaded objects are read in place, never copied. On macOS and Windows, the loader's callbacks keep the module set current: an object's module is removed before the object is unmapped. On Linux and FreeBSD, call `fh_modules_refresh` after every `dlopen` and `dlclose` (obligations 3, 4 and 6). Until then, walks use the old set, and frames in newly loaded objects are unwound by frame pointer. Windows works the same way if it does not accept this library's DLL notifications.
+The unwind tables and code of loaded objects are read in place, never copied. On macOS and Windows, the loader's callbacks keep the module set current: an object's module is removed before the object is unmapped. On Linux and FreeBSD, call `fh_modules_refresh` after every `dlopen` and `dlclose` (obligations 3, 4 and 6). Until then, walks use the old set, and frames in newly loaded objects are unwound by frame pointer. Windows works the same way if it does not accept this library's DLL notifications. Once process shutdown has begun (`ExitProcess`), Windows no longer updates the set.
 
 Unloading can make a walk fault. A walk that runs while an object is unloaded can read the unmapped object. On Linux and FreeBSD, and on Windows without DLL notifications, a `dlclose` without a following `fh_modules_refresh` also leaves a module whose tables may be unmapped. Julia recovers from such faults with `jl_set_safe_restore`.
 
