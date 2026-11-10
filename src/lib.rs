@@ -138,9 +138,9 @@ mod api {
         crate::modules::refresh();
     }
 
-    /// Unregisters the loader callbacks of this library. Must be called once before process
-    /// exit or before this library is unloaded, after profiling stops. Not async-signal-safe.
-    /// On platforms other than Windows this call has no effect.
+    /// Unregisters the loader callbacks of this library. Must be called before this library
+    /// is unloaded, after profiling stops. Not async-signal-safe. On platforms other than
+    /// Windows this call has no effect.
     #[no_mangle]
     pub extern "C" fn fh_fini() {
         crate::modules::fini();

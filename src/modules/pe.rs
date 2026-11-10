@@ -23,6 +23,10 @@
 //! never waits on the loader (see the lock order in `modules/mod.rs`). `FreeLibrary` waits
 //! on the loader, so the enumeration releases its pin before it takes the registry lock.
 //!
+//! Once process shutdown has begun, the callback does nothing. `ExitProcess` kills every
+//! other thread before the remaining `DllMain` calls run, and a killed thread can own the
+//! registry lock, which the callback would then wait on forever.
+//!
 //! Julia's Windows sampler suspends the target thread and unwinds it from a separate thread.
 //! The PE unwind path does not allocate (see `vendor/README.md`), so the target can hold the
 //! heap lock. Enumeration must not run while a target is suspended (loader-lock hazard).
@@ -171,6 +175,7 @@ type RegisterFn = unsafe extern "system" fn(
     cookie: *mut *mut c_void,
 ) -> i32;
 type UnregisterFn = unsafe extern "system" fn(cookie: *mut c_void) -> i32;
+type ShutdownInProgressFn = unsafe extern "system" fn() -> u8;
 
 /// The registration cookie, null when not registered. Registration and unregistration take
 /// no lock of this library while they call into ntdll, which can wait on the loader, because
@@ -178,6 +183,9 @@ type UnregisterFn = unsafe extern "system" fn(cookie: *mut c_void) -> i32;
 static COOKIE: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
 /// True while notifications keep the module set current, so `refresh` can return early.
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// `RtlDllShutdownInProgress`, resolved before registration so that the callback does not
+/// look it up.
+static SHUTDOWN_IN_PROGRESS: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
 
 unsafe fn ntdll_fn(name: &core::ffi::CStr) -> Option<*const c_void> {
     let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
@@ -196,6 +204,12 @@ pub fn register_notifications() -> bool {
     // SAFETY: resolving and calling documented ntdll exports with the documented
     // signatures; the callback is a process-lifetime `extern "system"` function.
     unsafe {
+        // Without the shutdown check the callback could hang process exit, so do not
+        // register without it.
+        let Some(shutdown) = ntdll_fn(c"RtlDllShutdownInProgress") else {
+            return false;
+        };
+        SHUTDOWN_IN_PROGRESS.store(shutdown.cast_mut(), Ordering::Release);
         let Some(register) = ntdll_fn(c"LdrRegisterDllNotification") else {
             return false;
         };
@@ -245,6 +259,20 @@ pub fn notifications_active() -> bool {
     ACTIVE.load(Ordering::Acquire)
 }
 
+/// True once process shutdown has begun (see the module docs).
+fn shutdown_in_progress() -> bool {
+    let shutdown = SHUTDOWN_IN_PROGRESS.load(Ordering::Acquire);
+    if shutdown.is_null() {
+        return false;
+    }
+    // SAFETY: `shutdown` is ntdll's `RtlDllShutdownInProgress`, which takes no arguments
+    // and returns a BOOLEAN.
+    unsafe {
+        let shutdown: ShutdownInProgressFn = core::mem::transmute(shutdown);
+        shutdown() != 0
+    }
+}
+
 /// The notification callback. Runs on the loading or unloading thread with the loader busy
 /// (see the module docs). It must never call the loader.
 unsafe extern "system" fn on_notification(
@@ -252,7 +280,7 @@ unsafe extern "system" fn on_notification(
     data: *const NotificationData,
     _context: *const c_void,
 ) {
-    if data.is_null() {
+    if data.is_null() || shutdown_in_progress() {
         return;
     }
     // SAFETY: the loader passes a valid structure for the duration of the call.

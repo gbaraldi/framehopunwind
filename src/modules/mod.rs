@@ -124,9 +124,8 @@ pub fn init() {
     refresh_scan();
 }
 
-/// Unregister the Windows DLL notifications, so that no callback runs during process
-/// teardown. A thread that `ExitProcess` killed can still own the registry lock there.
-/// Off the signal path.
+/// Unregister the Windows DLL notifications, so that no callback runs after this library is
+/// unloaded. Off the signal path.
 pub fn fini() {
     #[cfg(windows)]
     {
