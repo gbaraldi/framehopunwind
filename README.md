@@ -25,7 +25,7 @@ See [`include/framehopunwind.h`](include/framehopunwind.h) for the full, documen
 The split is deliberate:
 
 * **Read path — async-signal-safe** (`fh_capture_context`, `fh_context_from_ucontext`, `fh_cursor_init`, `fh_step`, `fh_get_reg`, `fh_cursor_fini`): no heap allocation (framehop `MustNotAllocateDuringUnwind` + a preallocated per-cursor `Cache`), no locks (module set read via a hand-rolled hazard-pointer snapshot, never the writer mutex), no `free` (retired snapshots are reclaimed only on the writer thread). `panic = "abort"` in release prevents unwinding across the FFI boundary.
-* **Mutating path — NOT signal-safe** (`fh_init`, `fh_thread_register`, `fh_modules_refresh`, `fh_register_jit*`, `fh_deregister_jit*`): runs off the signal path (startup, dlopen, JIT compile). It needs no exclusion from concurrent walks, which read an immutable snapshot.
+* **Mutating path — NOT signal-safe** (`fh_init`, `fh_fini`, `fh_thread_register`, `fh_modules_refresh`, `fh_register_jit*`, `fh_deregister_jit*`): runs off the signal path (startup, dlopen, dlclose, JIT compile). It needs no exclusion from concurrent walks, which read an immutable snapshot.
 
 The one bounded resource is the cursor **slot pool**. It starts at `fh_init(num_slots)` slots (default 16) and grows by two for each `fh_thread_register`, up to 1024; each slot holds a preallocated cache of about 20 KB. If every slot is busy, `fh_cursor_init` returns an error and that sample is skipped — it never blocks or allocates.
 
@@ -93,15 +93,15 @@ cargo test                 # host unit/integration tests (Linux x86_64)
 
 ## Julia integration
 
-The integration lives on the JuliaLang julia branch [`gb/framehop-unwinder`](https://github.com/JuliaLang/julia/tree/gb/framehop-unwinder) (wired up via `deps/framehopunwind.mk`; an earlier snapshot existed here as `julia-framehop-integration.patch`, dropped in `2dacae3`). It is **additive and gated**: with `JL_USE_FRAMEHOP` undefined the Julia build is byte-for-byte unchanged. It is enabled by defining `JL_ENABLE_FRAMEHOP` at build time; `JL_USE_FRAMEHOP` is then derived only for Linux/FreeBSD on x86_64/aarch64 (extend the predicate in `julia_internal.h` as more platforms are validated).
+The integration lives on the JuliaLang julia branch [`gb/framehop-unwinder`](https://github.com/JuliaLang/julia/tree/gb/framehop-unwinder) (wired up via `deps/framehopunwind.mk`; an earlier snapshot existed here as `julia-framehop-integration.patch`, dropped in `2dacae3`). It is **additive and gated**: with `JL_USE_FRAMEHOP` undefined the Julia build is byte-for-byte unchanged. It is enabled by defining `JL_ENABLE_FRAMEHOP` at build time; `JL_USE_FRAMEHOP` is then derived only for Linux, FreeBSD and macOS on x86_64/aarch64 (extend the predicate in `julia_internal.h` as more platforms are validated).
 
-What it changes (Linux/FreeBSD scope):
+What it changes:
 
 * `julia_internal.h` — under `JL_USE_FRAMEHOP`, `bt_cursor_t` becomes `fh_cursor`; `bt_context_t` stays `unw_context_t` (== `ucontext_t`), so `jl_to_bt_context`, longjmp simulation, and thread-suspend all keep working, and **libunwind stays linked** for `task.c` context switching and proc-info lookup.
 * `stackwalk.c` — `jl_unw_init` converts the `ucontext_t` to framehop registers; `jl_unw_step` calls `fh_step`; a `jl_unw_fini` macro releases the cursor slot at each call site.
 * `debuginfo.cpp` — `register_eh_frames` additionally calls `fh_register_jit` (alongside the existing `__register_frame` + `_U_dyn_register`); `deregister_eh_frames` calls `fh_deregister_jit_eh_frame`.
 * `init.c` / `threading.c` — `fh_init(0)` at startup and `fh_thread_register()` per thread.
-* `dlload.c` — `fh_modules_refresh()` after a successful `dlopen`.
+* `dlload.c` — `fh_modules_refresh()` after a successful `dlopen` and after `dlclose`.
 
 Build glue (implemented on the branch via a `src/Makefile` block): build Julia with
 
