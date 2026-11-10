@@ -361,7 +361,8 @@ fn unload_of_unpublished_image_invalidates_scans() {
 }
 
 /// The DLL notifications add a DLL to the set before `LoadLibrary` returns, and drop it
-/// before `FreeLibrary` unmaps it.
+/// before `FreeLibrary` unmaps it. The loader lists the DLL by the time of its loaded
+/// notification and no longer lists it by the time of its unloaded one.
 #[cfg(windows)]
 #[test]
 fn dll_notifications_track_load_and_unload() {
@@ -380,19 +381,36 @@ fn dll_notifications_track_load_and_unload() {
     .into_iter()
     .find(|name| unsafe { GetModuleHandleA(name.as_ptr().cast()) }.is_null())
     .expect("every candidate DLL is already loaded");
-    let handle = unsafe { LoadLibraryA(name.as_ptr().cast()) };
-    assert!(!handle.is_null(), "cannot load {name:?}");
-    let base = handle as u64;
-    assert!(
-        modules::static_module_state(base).0,
-        "{name:?} is not in the set"
-    );
-    unsafe { FreeLibrary(handle) };
-    // Another thread can hold a reference, in which case the DLL stays loaded.
-    if unsafe { GetModuleHandleA(name.as_ptr().cast()) }.is_null() {
+    let mut base = 0;
+    let mut unloaded = false;
+    let events = modules::observe_notifications(|| {
+        let handle = unsafe { LoadLibraryA(name.as_ptr().cast()) };
+        assert!(!handle.is_null(), "cannot load {name:?}");
+        base = handle as u64;
         assert!(
-            !modules::static_module_state(base).0,
-            "{name:?} is still in the set"
+            modules::static_module_state(base).0,
+            "{name:?} is not in the set"
+        );
+        unsafe { FreeLibrary(handle) };
+        // Another thread can hold a reference, in which case the DLL stays loaded.
+        unloaded = unsafe { GetModuleHandleA(name.as_ptr().cast()) }.is_null();
+        if unloaded {
+            assert!(
+                !modules::static_module_state(base).0,
+                "{name:?} is still in the set"
+            );
+        }
+    });
+    const LOADED: u32 = 1;
+    const UNLOADED: u32 = 2;
+    assert!(
+        events.contains(&(LOADED, base, Some(true))),
+        "{name:?} at {base:#x} is not listed at its loaded notification: {events:x?}"
+    );
+    if unloaded {
+        assert!(
+            events.contains(&(UNLOADED, base, Some(false))),
+            "{name:?} at {base:#x} is listed at its unloaded notification: {events:x?}"
         );
     }
 }

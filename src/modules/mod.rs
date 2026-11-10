@@ -451,6 +451,9 @@ pub(crate) fn notifications_active() -> bool {
     pe::notifications_active()
 }
 
+#[cfg(all(test, windows))]
+pub(crate) use pe::observe_notifications;
+
 /// Hash helper for static-module fingerprints.
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn fingerprint_of(parts: &[u64], name: &[u8]) -> u64 {
