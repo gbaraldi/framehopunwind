@@ -7,7 +7,9 @@
 //! (`LdrRegisterDllNotification`) keep the set current. The loaded notification runs after
 //! the image is mapped, before dynamic linking and its `DllMain`. The unloaded one runs
 //! before the image is unmapped. Thus the set is exact, and sections are read in place (see
-//! `Bytes`). The initial enumeration pins each module (`GetModuleHandleExW`, released
+//! `Bytes`). `EnumProcessModules` lists a DLL by the time of its loaded notification, and
+//! no longer lists it by the time of its unloaded one. Thus an enumeration that runs after
+//! a notification agrees with it. The initial enumeration pins each module (`GetModuleHandleExW`, released
 //! with `FreeLibrary`) while it parses the image, so a concurrent `FreeLibrary` cannot
 //! unmap it. An image that it parsed can be unloaded after the pin is released, before the
 //! result is published. The unloaded notification then makes the enumeration run again.
@@ -300,6 +302,59 @@ unsafe extern "system" fn on_notification(
         LDR_DLL_NOTIFICATION_REASON_UNLOADED => super::image_removed(base),
         _ => {}
     }
+}
+
+/// Test hook: the notifications that the loader sends while `f` runs, as
+/// `(reason, base, listed)`. `listed` tells whether `EnumProcessModules` listed the DLL
+/// during the notification, or `None` if the enumeration failed.
+#[cfg(test)]
+pub fn observe_notifications(f: impl FnOnce()) -> Vec<(u32, u64, Option<bool>)> {
+    use std::sync::Mutex;
+
+    static EVENTS: Mutex<Vec<(u32, u64, Option<bool>)>> = Mutex::new(Vec::new());
+
+    unsafe fn listed(base: u64) -> Option<bool> {
+        let mut handles: [HMODULE; 1024] = [core::ptr::null_mut(); 1024];
+        let mut needed: u32 = 0;
+        let ok = EnumProcessModules(
+            GetCurrentProcess(),
+            handles.as_mut_ptr(),
+            core::mem::size_of_val(&handles) as u32,
+            &mut needed,
+        );
+        if ok == 0 {
+            return None;
+        }
+        let count = needed as usize / core::mem::size_of::<HMODULE>();
+        if handles.iter().take(count).any(|&h| h as u64 == base) {
+            return Some(true);
+        }
+        (count <= handles.len()).then_some(false)
+    }
+
+    unsafe extern "system" fn observer(
+        reason: u32,
+        data: *const NotificationData,
+        _context: *const c_void,
+    ) {
+        if data.is_null() {
+            return;
+        }
+        let base = (*data).dll_base as u64;
+        EVENTS.lock().unwrap().push((reason, base, listed(base)));
+    }
+
+    EVENTS.lock().unwrap().clear();
+    // SAFETY: as in `register_notifications`; the cookie is unregistered below.
+    unsafe {
+        let register = ntdll_fn(c"LdrRegisterDllNotification").unwrap();
+        let register: RegisterFn = core::mem::transmute(register);
+        let mut cookie: *mut c_void = core::ptr::null_mut();
+        assert_eq!(register(0, observer, core::ptr::null(), &mut cookie), 0);
+        f();
+        unregister_cookie(cookie);
+    }
+    core::mem::take(&mut *EVENTS.lock().unwrap())
 }
 
 /// Read IMAGE_FILE_HEADER.TimeDateStamp from the loaded image at `base` (0 if the
